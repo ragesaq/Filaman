@@ -8,6 +8,7 @@ let lastHeartbeatResponse = Date.now();
 const HEARTBEAT_TIMEOUT = 20000;
 let reconnectTimer = null;
 let spoolDetected = false;
+let lastAmsData = null; // Store last AMS data to re-render when Spoolman data loads
 
 // WebSocket Funktionen
 function startHeartbeat() {
@@ -59,7 +60,8 @@ function initWebSocket() {
     }
 
     try {
-        socket = new WebSocket('ws://' + window.location.host + '/ws');
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(protocol + '//' + window.location.host + '/ws');
         
         socket.onopen = function() {
             isConnected = true;
@@ -97,6 +99,7 @@ function initWebSocket() {
             
             const data = JSON.parse(event.data);
             if (data.type === 'amsData') {
+                lastAmsData = data.payload; // Store for re-rendering
                 displayAmsData(data.payload);
             } else if (data.type === 'nfcTag') {
                 updateNfcStatusIndicator(data.payload);
@@ -203,6 +206,11 @@ document.addEventListener("DOMContentLoaded", function() {
 // Event Listener für Spoolman Events
 document.addEventListener('spoolDataLoaded', function(event) {
     window.populateVendorDropdown(event.detail);
+    // Re-render AMS data now that Spoolman data is available
+    if (lastAmsData) {
+        console.log('Spoolman data loaded, re-rendering AMS display');
+        displayAmsData(lastAmsData);
+    }
 });
 
 document.addEventListener('spoolmanError', function(event) {
@@ -240,15 +248,87 @@ function updateNfcInfo() {
     }
 }
 
-function displayAmsData(amsData) {
+// Lookup Spoolman spool data by tag field (supports both tag_uid and tray_uuid matching)
+async function lookupSpoolByTag(tagUid, trayUuid = null) {
+    // Get spools data from the global spoolman.js module
+    const spools = window.getSpoolData ? window.getSpoolData() : [];
+    if (!spools || spools.length === 0) {
+        console.log('lookupSpoolByTag: No spool data available');
+        return null;
+    }
+    
+    // Clean the tray_uuid if provided (remove dashes, uppercase)
+    const cleanTrayUuid = trayUuid ? trayUuid.replace(/[^a-zA-Z0-9]/g, '').toUpperCase() : null;
+    
+    // Check if tray_uuid is valid (not all zeros)
+    const hasValidTrayUuid = cleanTrayUuid && cleanTrayUuid !== '00000000000000000000000000000000' && cleanTrayUuid.length > 0;
+    
+    // Clean the tag_uid if provided
+    const cleanTagUid = tagUid ? tagUid.replace(/[^a-zA-Z0-9]/g, '').toUpperCase() : null;
+    const hasValidTagUid = cleanTagUid && cleanTagUid !== '0000000000000000' && cleanTagUid.length > 0;
+    
+    if (!hasValidTagUid && !hasValidTrayUuid) {
+        return null;
+    }
+    
+    // Bambu tag_uid format: first 8 chars are the NFC UID (4 bytes), rest is additional data
+    const bambuUidPortion = cleanTagUid ? cleanTagUid.substring(0, 8) : null; // 4-byte UID
+    
+    console.log(`lookupSpoolByTag: Looking for tag_uid=${tagUid}, tray_uuid=${trayUuid}`);
+    
+    try {
+        // Search in the loaded spoolsData for matching tag
+        const matchingSpool = spools.find(spool => {
+            if (spool.extra && spool.extra.tag) {
+                // Clean the stored tag for comparison - remove quotes and non-alphanumeric
+                const storedTag = spool.extra.tag.replace(/[^a-zA-Z0-9]/g, '').replace(/"/g, '').toUpperCase();
+                
+                // First, try to match by tray_uuid (most reliable for Bambu spools)
+                if (hasValidTrayUuid && storedTag === cleanTrayUuid) {
+                    console.log(`lookupSpoolByTag: MATCH by tray_uuid! Spool ID ${spool.id}, stored tag: ${storedTag}`);
+                    return true;
+                }
+                
+                // Also try matching by tag_uid
+                if (hasValidTagUid) {
+                    // The stored tag format is: UID (8 or 14 chars) + 8 random chars
+                    // Extract the UID portion from stored tag
+                    const storedUidPortion = storedTag.substring(0, 8);
+                    
+                    // Match if the UID portions are equal
+                    const match = storedUidPortion === bambuUidPortion ||
+                           storedTag.startsWith(bambuUidPortion) ||
+                           cleanTagUid.startsWith(storedUidPortion);
+                    
+                    if (match) {
+                        console.log(`lookupSpoolByTag: MATCH by tag_uid! Spool ID ${spool.id}, stored tag: ${storedTag}`);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        });
+        
+        if (!matchingSpool) {
+            console.log(`lookupSpoolByTag: No match found for tag_uid=${bambuUidPortion}, tray_uuid=${cleanTrayUuid}`);
+        }
+        
+        return matchingSpool;
+    } catch (error) {
+        console.error('Error looking up spool by tag:', error);
+        return null;
+    }
+}
+
+async function displayAmsData(amsData) {
     const amsDataContainer = document.getElementById('amsData');
     amsDataContainer.innerHTML = ''; 
 
-    amsData.forEach((ams) => {
+    for (const ams of amsData) {
         // Bestimme den Anzeigenamen für das AMS
         const amsDisplayName = ams.ams_id === 255 ? 'External Spool' : `AMS ${ams.ams_id}`;
         
-        const trayHTML = ams.tray.map(tray => {
+        const trayHTMLArray = await Promise.all(ams.tray.map(async (tray) => {
             // Prüfe ob überhaupt Daten vorhanden sind
             const relevantFields = ['tray_type', 'tray_sub_brands', 'tray_info_idx', 'setting_id', 'cali_idx'];
             const hasAnyContent = relevantFields.some(field => 
@@ -261,6 +341,14 @@ function displayAmsData(amsData) {
             // Bestimme den Anzeigenamen für das Tray
             const trayDisplayName = (ams.ams_id === 255) ? 'External' : `Tray ${tray.id}`;
 
+            // Try to look up Spoolman data for this tray's tag_uid or tray_uuid
+            let spoolmanData = null;
+            const hasTagUid = tray.tag_uid && tray.tag_uid !== '0000000000000000';
+            const hasTrayUuid = tray.tray_uuid && tray.tray_uuid !== '00000000000000000000000000000000';
+            if (hasTagUid || hasTrayUuid) {
+                spoolmanData = await lookupSpoolByTag(tray.tag_uid, tray.tray_uuid);
+            }
+
             // Nur für nicht-leere Trays den Button-HTML erstellen
             const buttonHtml = `
                 <button class="spool-button" onclick="handleSpoolIn(${ams.ams_id}, ${tray.id})" 
@@ -270,7 +358,6 @@ function displayAmsData(amsData) {
                     <img src="spool_in.png" alt="Spool In" style="width: 48px; height: 48px;">
                 </button>`;
             
-                        // Nur für nicht-leere Trays den Button-HTML erstellen
             const outButtonHtml = `
                 <button class="spool-button" onclick="handleSpoolOut()" 
                         style="position: absolute; top: -35px; right: -15px; 
@@ -299,62 +386,61 @@ function displayAmsData(amsData) {
                     <hr>`;
             }
 
-            // Generiere den Type mit Color-Box zusammen
-            const typeWithColor = tray.tray_type ? 
-                `<p>Typ: ${tray.tray_type} ${tray.tray_color ? `<span style="
-                    background-color: #${tray.tray_color}; 
+            // Get color - prefer Spoolman color, fall back to AMS color
+            const displayColor = spoolmanData?.filament?.color_hex || tray.tray_color?.substring(0, 6) || 'FFFFFF';
+            
+            // Build display content - prefer Spoolman data when available, no labels
+            let contentLines = [];
+            
+            // Manufacturer (from Spoolman vendor name)
+            if (spoolmanData?.filament?.vendor?.name) {
+                contentLines.push(`<p>${spoolmanData.filament.vendor.name}</p>`);
+            } else if (tray.tray_sub_brands) {
+                contentLines.push(`<p>${tray.tray_sub_brands}</p>`);
+            }
+            
+            // Brand Name (from Spoolman filament name)
+            if (spoolmanData?.filament?.name) {
+                contentLines.push(`<p>${spoolmanData.filament.name}</p>`);
+            }
+            
+            // Material (from Spoolman or AMS)
+            const material = spoolmanData?.filament?.material || tray.tray_type || '';
+            if (material) {
+                // Show material with color box
+                contentLines.push(`<p>${material} <span style="
+                    background-color: #${displayColor}; 
                     width: 20px; 
                     height: 20px; 
                     display: inline-block; 
                     vertical-align: middle;
                     border: 1px solid #333;
                     border-radius: 3px;
-                    margin-left: 5px;"></span>` : ''}</p>` : '';
-
-            // Array mit restlichen Tray-Eigenschaften
-            const trayProperties = [
-                { key: 'tray_sub_brands', label: 'Sub Brands' },
-                { key: 'tray_info_idx', label: 'Filament IDX' },
-                { key: 'setting_id', label: 'Setting ID' },
-                { key: 'cali_idx', label: 'Calibration IDX' }
-            ];
-
-            // Nur gültige Felder anzeigen
-            const trayDetails = trayProperties
-                .filter(prop => 
-                    tray[prop.key] !== null && 
-                    tray[prop.key] !== undefined && 
-                    tray[prop.key] !== '' &&
-                    tray[prop.key] !== 'null'
-                )
-                .map(prop => {
-                    // Spezielle Behandlung für setting_id
-                    if (prop.key === 'cali_idx' && tray[prop.key] === '-1') {
-                        return `<p>${prop.label}: not calibrated</p>`;
-                    }
-                    return `<p>${prop.label}: ${tray[prop.key]}</p>`;
-                })
-                .join('');
-
-            // Temperaturen nur anzeigen, wenn beide nicht 0 sind
-            const tempHTML = (tray.nozzle_temp_min > 0 && tray.nozzle_temp_max > 0) 
-                ? `<p>Nozzle Temp: ${tray.nozzle_temp_min}°C - ${tray.nozzle_temp_max}°C</p>`
-                : '';
+                    margin-left: 5px;"></span></p>`);
+            }
+            
+            // Remaining Weight (from Spoolman)
+            if (spoolmanData?.remaining_weight !== null && spoolmanData?.remaining_weight !== undefined) {
+                contentLines.push(`<p>${Math.round(spoolmanData.remaining_weight)}g</p>`);
+            } else if (tray.remain && tray.remain > 0) {
+                // Fall back to AMS remain percentage
+                contentLines.push(`<p>${tray.remain}%</p>`);
+            }
 
             return `
-                <div class="tray" ${tray.tray_color ? `style="border-left: 4px solid #${tray.tray_color};"` : 'style="border-left: 4px solid #007bff;"'}>
+                <div class="tray" style="border-left: 4px solid #${displayColor};">
                     <div style="position: relative;">
                         ${buttonHtml}
                         <p class="tray-head">${trayDisplayName}</p>
-                        ${typeWithColor}
-                        ${trayDetails}
-                        ${tempHTML}
+                        ${contentLines.join('')}
                         ${(ams.ams_id === 255 && tray.tray_type !== '') ? outButtonHtml : ''}
                         ${(tray.setting_id != "" && tray.setting_id != "null") ? spoolmanButtonHtml : ''}
                     </div>
                     
                 </div>`;
-        }).join('');
+        }));
+
+        const trayHTML = trayHTMLArray.join('');
 
         const amsInfo = `
             <div class="feature">
@@ -365,7 +451,7 @@ function displayAmsData(amsData) {
             </div>`;
         
         amsDataContainer.innerHTML += amsInfo;
-    });
+    }
 }
 
 // Neue Funktion zum Anzeigen/Ausblenden der Spool-Buttons
@@ -635,7 +721,7 @@ function writeNfcTag() {
         );
 
         if (!selectedSpool) {
-            alert('Ausgewählte Spule konnte nicht gefunden werden.');
+            alert('Selected spool could not be found.');
             return;
         }
 
@@ -744,3 +830,32 @@ function showNotification(message, isSuccess) {
         }, 300);
     }, 3000);
 }
+
+// Polling fallback for AMS data (when WebSocket fails, e.g. behind Nginx)
+function pollAmsData() {
+    // Only poll if WebSocket is NOT connected
+    if (isConnected) return;
+
+    fetch('/api/ams')
+        .then(response => {
+            if (!response.ok) throw new Error('Network response was not ok');
+            return response.json();
+        })
+        .then(data => {
+            if (Array.isArray(data) && data.length > 0) {
+                displayAmsData(data);
+                // Hide connection error if we are successfully polling data
+                const statusElement = document.querySelector('.connection-status');
+                if (statusElement && !statusElement.classList.contains('hidden')) {
+                     statusElement.classList.add('hidden');
+                     statusElement.classList.remove('visible');
+                }
+            }
+        })
+        .catch(error => {
+            // console.log('Polling error:', error);
+        });
+}
+
+// Start polling every 2 seconds
+setInterval(pollAmsData, 2000);

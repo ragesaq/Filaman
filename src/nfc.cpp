@@ -1,7 +1,15 @@
 #include "nfc.h"
+#include "led.h"
 #include <Arduino.h>
+#ifndef USE_RC522
 #include <Adafruit_PN532.h>
+#else
+#include <SPI.h>
+#include <MFRC522.h>
+#define PN532_MIFARE_ISO14443A 0x00
+#endif
 #include <ArduinoJson.h>
+#include <deque>
 #include "config.h"
 #include "website.h"
 #include "api.h"
@@ -10,10 +18,370 @@
 #include "bambu.h"
 #include "main.h"
 
+namespace {
+constexpr bool kNfcDiagnosticsEnabled = false; // set true when debugging NFC; keep false to let MQTT logs show
+}
+
+#ifndef USE_RC522
 //Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET);
+#else
+MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
+
+// Track last reported VersionReg to throttle repeated diagnostics
+#ifdef USE_RC522
+static uint8_t rc522LastVersion = 0xFF;
+static unsigned long rc522LastVersionTS = 0;
+const unsigned long rc522HeartbeatInterval = 10000; // 10s
+// Disable verbose register dumps by default to keep detection fast.
+static bool rc522Verbose = kNfcDiagnosticsEnabled;
+// Enable lightweight timing diagnostics for read latency measurements.
+static bool rc522MeasureTiming = kNfcDiagnosticsEnabled;
+// Count consecutive invalid VersionReg readings before forcing hardware recovery
+static int rc522ConsecutiveInvalid = 0;
+#endif
+
+class Rc522Nfc {
+  public:
+    void begin() {
+      // Initialize SPI with explicit pins
+      SPI.begin(18, 19, 23, RC522_SS_PIN);
+      delay(50);
+      
+      // Ensure reset pin is configured and issue a reset pulse to improve reliability
+      pinMode(RC522_RST_PIN, OUTPUT);
+      digitalWrite(RC522_RST_PIN, HIGH);
+      delay(10);
+      digitalWrite(RC522_RST_PIN, LOW);
+      delay(50);
+      digitalWrite(RC522_RST_PIN, HIGH);
+      delay(50);
+
+      // Initialize RC522
+      rfid.PCD_Init();
+      delay(100);
+      
+      // Set Antenna Gain to 43dB (optimized for stability)
+      rfid.PCD_SetAntennaGain(rfid.RxGain_43dB);
+      
+      // Verify communication
+      byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+      Serial.print("RC522 Firmware Version: 0x");
+      Serial.print(version, HEX);
+      if (version == 0x00 || version == 0xFF) {
+        Serial.println(" - WARNING: Communication problem or no RC522 detected!");
+
+        // Try reinitializing SPI without explicit pin mapping (fallback to default VSPI)
+        Serial.println("RC522: attempting fallback SPI.begin() and re-init...");
+        SPI.begin();
+        delay(50);
+        rfid.PCD_Init();
+        delay(100);
+        version = rfid.PCD_ReadRegister(rfid.VersionReg);
+        Serial.print("RC522 Fallback Version: 0x");
+        Serial.print(version, HEX);
+        if (version == 0x00 || version == 0xFF) {
+          Serial.println(" - still no RC522 detected");
+        } else {
+          Serial.println(" - OK after fallback");
+        }
+      } else {
+        Serial.println(" - OK");
+      }
+      
+      // Ensure antenna is explicitly enabled after init
+      rfid.PCD_AntennaOn();
+      Serial.println("RC522 SPI initialization complete - antenna ON");
+    }
+
+    void dumpRegisters(const char* ctx) {
+      // Print a small set of RC522 registers for diagnostics
+      MFRC522::PCD_Register regs[] = { MFRC522::VersionReg, MFRC522::CommandReg, MFRC522::ErrorReg, MFRC522::FIFOLevelReg, MFRC522::CollReg, MFRC522::DivIrqReg, MFRC522::ComIEnReg };
+      Serial.print("[RC522 DUMP] "); Serial.print(ctx); Serial.print(" -> ");
+      for (uint8_t i = 0; i < sizeof(regs)/sizeof(regs[0]); i++) {
+        byte v = rfid.PCD_ReadRegister(regs[i]);
+        if (v < 0x10) Serial.print("0");
+        Serial.print(v, HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+
+    uint32_t getFirmwareVersion() {
+      // RC522 does not expose the same info; return non-zero to signal presence
+      byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+      return (version == 0x00 || version == 0xFF) ? 0 : 0xDEADBEEF;
+    }
+
+    void SAMConfig() {
+      // Not required for RC522
+    }
+
+    bool readPassiveTargetID(uint8_t /*cardbaudrate*/, uint8_t* uid, uint8_t* uidLength, uint16_t timeout = 0) {
+      // Ensure clean state (mimic test_mfrc.cpp logic)
+      rfid.PCD_Init(); 
+      rfid.PCD_SetAntennaGain(rfid.RxGain_43dB);
+
+      // FIX: Toggle Antenna OFF/ON to force field reset and prevent "Sticky UID"
+      // This ensures the card loses power and resets its state before we try to detect it.
+      rfid.PCD_AntennaOff();
+      delay(50);
+      rfid.PCD_AntennaOn();
+      delay(10);
+
+      const unsigned long start = millis();
+      
+      while (true) {
+        esp_task_wdt_reset();
+        yield();
+
+        // Explicitly flush FIFO before checking for card
+        rfid.PCD_WriteRegister(rfid.FIFOLevelReg, 0x80);
+
+        bool present = rfid.PICC_IsNewCardPresent();
+
+        // If no new card present, yield briefly and continue (no diagnostics)
+        if (!present) {
+          if (timeout && (millis() - start) > timeout) return false;
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+
+        unsigned long t_present = 0;
+        if (rc522MeasureTiming) t_present = micros();
+        // When a card is present, read some registers for diagnostics BEFORE attempting serial read
+        byte preVR = rfid.PCD_ReadRegister(rfid.VersionReg);
+        if (kNfcDiagnosticsEnabled) {
+          Serial.print("[DIAG] Card present - VersionReg=0x"); Serial.println(preVR, HEX);
+        }
+        if (rc522Verbose) dumpRegisters("present-before-read");
+
+        // Attempt to select/read the card serial
+        bool readSerial = rfid.PICC_ReadCardSerial();
+        if (!readSerial) {
+          if (kNfcDiagnosticsEnabled) {
+            Serial.println("[DBG] PICC_IsNewCardPresent() true but PICC_ReadCardSerial() failed");
+          }
+          // Dump registers to help diagnose failure
+          if (rc522Verbose) dumpRegisters("readSerial-failed");
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+
+        // After a successful serial read, dump registers to capture chip state
+        unsigned long t_afterRead = 0;
+        if (rc522MeasureTiming) t_afterRead = micros();
+        byte postVR = rfid.PCD_ReadRegister(rfid.VersionReg);
+        if (kNfcDiagnosticsEnabled) {
+          Serial.print("[DIAG] After PICC_ReadCardSerial VersionReg=0x"); Serial.println(postVR, HEX);
+        }
+        if (rc522Verbose) dumpRegisters("after-read");
+
+        if (rc522MeasureTiming && kNfcDiagnosticsEnabled) {
+          unsigned long t_done = micros();
+          unsigned long dt_detect_ms = (t_afterRead > t_present) ? (t_afterRead - t_present) / 1000 : 0;
+          unsigned long dt_total_ms = (t_done > t_present) ? (t_done - t_present) / 1000 : 0;
+          Serial.print("[TIMING] detect_time_ms="); Serial.print(dt_detect_ms);
+          Serial.print(" read_total_ms="); Serial.println(dt_total_ms);
+        }
+
+        // If chip reports 0x00 or 0xFF, increment invalid counter and only perform hardware
+        // recovery after multiple consecutive invalid readings to avoid spurious slowdowns.
+        if (postVR == 0x00 || postVR == 0xFF) {
+          rc522ConsecutiveInvalid++;
+          if (kNfcDiagnosticsEnabled) {
+            Serial.print("[WARN] Invalid VersionReg (count="); Serial.print(rc522ConsecutiveInvalid);
+            Serial.print(") value=0x"); Serial.println(postVR, HEX);
+            if (rc522ConsecutiveInvalid >= 2) {
+              Serial.println("[WARN] Consecutive invalid threshold reached — performing hardware power-cycle.");
+              hardwarePowerCycle();
+              rc522ConsecutiveInvalid = 0;
+            }
+          } else if (rc522ConsecutiveInvalid >= 2) {
+            hardwarePowerCycle();
+            rc522ConsecutiveInvalid = 0;
+          }
+          // Clear any selected UID and retry the loop to detect the tag again
+          rfid.uid.size = 0;
+          vTaskDelay(pdMS_TO_TICKS(50));
+          // If we hit timeout while recovering, exit
+          if (timeout && (millis() - start) > timeout) return false;
+          continue;
+        } else {
+          rc522ConsecutiveInvalid = 0; // reset on success
+        }
+
+        // Copy UID and print it for diagnostics
+        *uidLength = rfid.uid.size;
+        memcpy(uid, rfid.uid.uidByte, rfid.uid.size);
+        Serial.print("[INFO] Detected UID: ");
+        for (uint8_t i = 0; i < *uidLength; i++) {
+          if (uid[i] < 0x10) Serial.print("0");
+          Serial.print(uid[i], HEX);
+          if (i + 1 < *uidLength) Serial.print(":");
+        }
+        Serial.println();
+
+        // Force stop crypto and halt to ensure clean state for next read
+        rfid.PCD_StopCrypto1();
+        // rfid.PICC_HaltA(); // DO NOT HALT HERE! We need to read pages immediately after!
+
+        // Keep card active; do not call PICC_HaltA() or PCD_StopCrypto1() here because
+        // that will remove the tag from the RF field and subsequent page reads will fail.
+        return true;
+      }
+    }
+
+    bool ntag2xx_ReadPage(uint8_t page, uint8_t* buffer) {
+      // Ensure a card is selected before reading.
+      // Do NOT call PICC_IsNewCardPresent() here because it detects *new* cards and
+      // may return false if the card is already selected. If no UID is present,
+      // attempt to read the card serial once.
+      if (rfid.uid.size == 0) {
+        // If we have no UID, we must try to select the card again
+        if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+          // Card not present or unable to read serial
+          return false;
+        }
+      }
+      
+      uint8_t tmp[18];
+      uint8_t size = sizeof(tmp);
+      MFRC522::StatusCode status = rfid.MIFARE_Read(page, tmp, &size);
+      
+      // Simple retry logic if read fails
+      if (status != MFRC522::STATUS_OK) {
+        // Serial.println("Read failed, attempting retry...");
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+        
+        // Try to re-select card if it was lost
+        if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+             // Serial.println("Card re-selected during read retry");
+        }
+
+        status = rfid.MIFARE_Read(page, tmp, &size);
+      }
+      
+      if (status != MFRC522::STATUS_OK) {
+        Serial.print("NTAG read error on page ");
+        Serial.print(page);
+        Serial.print(": ");
+        Serial.println(rfid.GetStatusCodeName(status));
+        // Dump registers to help diagnose transient comms/errors
+        dumpRegisters("ntag2xx_ReadPage failure");
+        return false;
+      }
+      
+      memcpy(buffer, tmp, 4);
+      return true;
+    }
+
+    bool ntag2xx_WritePage(uint8_t page, uint8_t* data) {
+      // Ensure a card is selected before writing. If the UID buffer is empty,
+      // attempt to read the serial once. Avoid calling PICC_IsNewCardPresent().
+      if (rfid.uid.size == 0) {
+        if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+          return false;
+        }
+      }
+      
+      MFRC522::StatusCode status = rfid.MIFARE_Ultralight_Write(page, data, 4);
+      
+      // Simple retry logic if write fails
+      if (status != MFRC522::STATUS_OK) {
+        Serial.println("Write failed, attempting retry...");
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+
+        // Try to re-select card if it was lost
+        if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+             Serial.println("Card re-selected during write retry");
+        }
+
+        status = rfid.MIFARE_Ultralight_Write(page, data, 4);
+      }
+
+      if (status != MFRC522::STATUS_OK) {
+        Serial.print("NTAG write error on page ");
+        Serial.print(page);
+        Serial.print(": ");
+        Serial.println(rfid.GetStatusCodeName(status));
+        dumpRegisters("ntag2xx_WritePage failure");
+      }
+      
+      return status == MFRC522::STATUS_OK;
+    }
+
+    // Perform a hardware-level power-cycle/reset of the RC522 module by
+    // toggling the reset pin and re-initializing SPI/PCD. This helps when
+    // soft resets don't clear internal RF state and subsequent tags are
+    // not being detected.
+    void hardwarePowerCycle() {
+      // Ensure reset pin is configured
+      pinMode(RC522_RST_PIN, OUTPUT);
+      Serial.println("[HW] Performing hardware power-cycle of RC522 (RST low)");
+      digitalWrite(RC522_RST_PIN, LOW);
+      // Hold reset low briefly to remove power from internal logic / RF field
+      vTaskDelay(pdMS_TO_TICKS(200));
+
+      // Bring chip out of reset and re-init SPI + PCD
+      digitalWrite(RC522_RST_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(150));
+
+      // Re-establish SPI (explicit bus pins) and init the RC522
+      SPI.end();
+      SPI.begin(18, 19, 23, RC522_SS_PIN);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      // Try multiple inits in case the chip needs extra time to come up
+      for (int attempt = 0; attempt < 3; attempt++) {
+        rfid.PCD_Init();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        byte v = rfid.PCD_ReadRegister(rfid.VersionReg);
+        Serial.print("[HW] PCD_Init attempt "); Serial.print(attempt+1);
+        Serial.print(" VersionReg=0x"); Serial.println(v, HEX);
+        if (v != 0x00 && v != 0xFF) break;
+      }
+      rfid.PCD_AntennaOn();
+      rfid.uid.size = 0;
+      Serial.println("[HW] RC522 hardware power-cycle complete and re-initialized");
+    }
+};
+
+Rc522Nfc nfc;
+#endif
 
 TaskHandle_t RfidReaderTask;
+
+struct WriteQueueEntry {
+  bool isSpoolTag;
+  char* payload;
+  String spoolId;
+};
+
+static std::deque<WriteQueueEntry*> writeQueue;
+static SemaphoreHandle_t writeQueueMutex = NULL;
+static volatile bool writeWorkerActive = false;
+static bool queueOverwriteConfirmation = false;
+static const unsigned long WRITE_QUEUE_TIMEOUT_MS = 120000UL;
+static unsigned long queueConfirmationStartMs = 0;
+static const unsigned long AMS_READ_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+static unsigned long amsReadWatchdogStartMs = 0;
+static unsigned long lastAmsSpoolReadEventMs = 0;
+static bool amsReadWatchdogArmed = false;
+
+static void ensureWriteQueueInit();
+static String extractSmId(const char* payload);
+static size_t getWriteQueueSize();
+static String peekWriteQueueSmId();
+static void updateQueueLedState();
+static void startNextWriteFromQueue();
+static void handleWriteQueueForTag(const String& detectedSmId);
+static void abortPendingQueueEntry(const char* reason);
+static void checkWriteQueueConfirmationTimeout();
+static void noteAmsSpoolReadEvent();
+static void armAmsReadWatchdog();
+static void disarmAmsReadWatchdog();
+static bool handleAmsReadTimeout();
+static void tryQueueTagForAmsTray();
 
 JsonDocument rfidData;
 String activeSpoolId = "";
@@ -39,6 +407,86 @@ volatile nfcReaderStateType nfcReaderState = NFC_IDLE;
 // 5 = erfolgreich geschrieben
 // 6 = reading
 // ***** PN532
+
+// Try to queue the scanned tag for automatic AMS tray assignment
+static void tryQueueTagForAmsTray() {
+    // Only try if there's valid JSON data from the tag
+    if (nfcJsonData.length() == 0) {
+        Serial.println("tryQueueTagForAmsTray: No tag data available");
+        return;
+    }
+    
+    // Parse the JSON to extract filament data
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, nfcJsonData);
+    if (error) {
+        Serial.println("tryQueueTagForAmsTray: Failed to parse tag JSON");
+        return;
+    }
+    
+    // Extract filament information from tag
+    String manufacturer = "";  // Vendor/manufacturer (Bambu Lab, Sunlu, etc.)
+    String material = "";      // Material type (PLA, PETG, etc.)
+    String brandName = "";     // Product brand name (PLA Basic, Rapid PETG, etc.)
+    String color = "";
+    int dryingTemp = 0;
+    int dryingTime = 0;
+    int nozzle_temp_min = 0;
+    int nozzle_temp_max = 0;
+    
+    // Format 1: Standard Filaman format with type, color_hex, brand, min_temp, max_temp
+    if (doc["type"].is<String>()) {
+        material = doc["type"].as<String>();
+    }
+    if (doc["color_hex"].is<String>()) {
+        color = doc["color_hex"].as<String>();
+        // Remove # prefix if present and ensure proper format
+        if (color.startsWith("#")) {
+            color = color.substring(1);
+        }
+    }
+    if (doc["brand"].is<String>()) {
+        manufacturer = doc["brand"].as<String>();  // In standard format, "brand" is manufacturer
+    }
+    if (doc["brand_name"].is<String>()) {
+        brandName = doc["brand_name"].as<String>();
+    }
+    if (doc["min_temp"].is<int>()) {
+        nozzle_temp_min = doc["min_temp"].as<int>();
+    }
+    if (doc["max_temp"].is<int>()) {
+        nozzle_temp_max = doc["max_temp"].as<int>();
+    }
+    if (doc["drying_temp"].is<int>()) {
+        dryingTemp = doc["drying_temp"].as<int>();
+    }
+    if (doc["drying_time"].is<int>()) {
+        dryingTime = doc["drying_time"].as<int>();
+    }
+    
+    // Format 2: Brand filament format with b (brand), an (article name), etc.
+    if (material.length() == 0 && doc["an"].is<String>()) {
+        material = doc["an"].as<String>();  // article name might contain material type
+    }
+    if (manufacturer.length() == 0 && doc["b"].is<String>()) {
+        manufacturer = doc["b"].as<String>();
+    }
+    
+    doc.clear();
+    
+    // Need at least material type to proceed
+    if (material.length() == 0) {
+        Serial.println("tryQueueTagForAmsTray: No material type found in tag data");
+        return;
+    }
+    
+    // Queue the tag for AMS tray assignment
+    Serial.println("Attempting to queue tag for AMS tray assignment:");
+    Serial.printf("  Manufacturer: %s, Material: %s, BrandName: %s\n", manufacturer.c_str(), material.c_str(), brandName.c_str());
+    Serial.printf("  Color: %s, Temps: %d-%d\n", color.c_str(), nozzle_temp_min, nozzle_temp_max);
+    
+    queueTagForTrayAssignment(nfcJsonData, manufacturer, material, brandName, color, dryingTemp, dryingTime, nozzle_temp_min, nozzle_temp_max);
+}
 
 // ##### Funktionen für RFID #####
 void payloadToJson(uint8_t *data) {
@@ -78,7 +526,7 @@ void payloadToJson(uint8_t *data) {
 
       doc.clear();
     } else {
-        Serial.println("Kein gültiger JSON-Inhalt gefunden oder fehlerhafte Formatierung.");
+        Serial.println("No valid JSON content found or malformed formatting.");
         //writeJsonToTag("{\"version\":\"1.0\",\"protocol\":\"NFC\",\"color_hex\":\"#FFFFFF\",\"type\":\"Example\",\"min_temp\":10,\"max_temp\":30,\"brand\":\"BrandName\"}");
     }
   }
@@ -89,7 +537,7 @@ bool formatNdefTag() {
     int pageOffset = 4; // Startseite für NDEF-Daten auf NTAG2xx
   
     Serial.println();
-    Serial.println("Formatiere NDEF-Tag...");
+    Serial.println("Formatting NDEF Tag...");
   
     // Schreibe die Initialisierungsnachricht auf die ersten Seiten
     for (int i = 0; i < sizeof(ndefInit); i += 4) {
@@ -121,10 +569,14 @@ bool robustPageRead(uint8_t page, uint8_t* buffer) {
         }
         
         Serial.printf("Page %d read failed, attempt %d/%d\n", page, attempt + 1, MAX_READ_ATTEMPTS);
+        // Dump some RC522 registers for each failed attempt to gather diagnostics
+      #ifdef USE_RC522
+        nfc.dumpRegisters("robustPageRead attempt");
+      #endif
         
         // Try to stabilize connection between attempts
         if (attempt < MAX_READ_ATTEMPTS - 1) {
-            vTaskDelay(pdMS_TO_TICKS(25));
+          vTaskDelay(pdMS_TO_TICKS(25)); // Restored to 25ms (original behavior)
             
             // Re-verify tag presence with quick check
             uint8_t uid[7];
@@ -259,7 +711,7 @@ bool initializeNdefStructure() {
     // Write minimal NDEF structure without destroying the tag
     // This creates a clean slate while preserving tag functionality
     
-    Serial.println("Initialisiere sichere NDEF-Struktur...");
+    Serial.println("Initializing secure NDEF structure...");
     
     // Minimal NDEF structure: TLV with empty message
     uint8_t minimalNdef[8] = {
@@ -279,7 +731,7 @@ bool initializeNdefStructure() {
         memcpy(pageBuffer, &minimalNdef[i], 4);
         
         if (!nfc.ntag2xx_WritePage(4 + (i / 4), pageBuffer)) {
-            Serial.print("Fehler beim Initialisieren von Seite ");
+            Serial.print("Error initializing page ");
             Serial.println(4 + (i / 4));
             return false;
         }
@@ -295,8 +747,8 @@ bool initializeNdefStructure() {
         Serial.println();
     }
     
-    Serial.println("✓ Sichere NDEF-Struktur initialisiert");
-    Serial.println("✓ Tag bleibt funktionsfähig und überschreibbar");
+    Serial.println("✓ Secure NDEF structure initialized");
+    Serial.println("✓ Tag remains functional and rewritable");
     return true;
 }
 
@@ -311,13 +763,13 @@ bool clearUserDataArea() {
     
     if (tagType == "NTAG213") {
         lastUserPage = 39;  // Pages 40-42 are config - DO NOT TOUCH!
-        Serial.println("NTAG213: Sichere Löschung Seiten 4-39");
+        Serial.println("NTAG213: Safe erase pages 4-39");
     } else if (tagType == "NTAG215") {
         lastUserPage = 129; // Pages 130-132 are config - DO NOT TOUCH!
-        Serial.println("NTAG215: Sichere Löschung Seiten 4-129");
+        Serial.println("NTAG215: Safe erase pages 4-129");
     } else if (tagType == "NTAG216") {
         lastUserPage = 225; // Pages 226-228 are config - DO NOT TOUCH!
-        Serial.println("NTAG216: Sichere Löschung Seiten 4-225");
+        Serial.println("NTAG216: Safe erase pages 4-225");
     } else {
         // Conservative fallback - only clear a small safe area
         lastUserPage = 39;
@@ -1259,6 +1711,7 @@ bool decodeNdefAndReturnJson(const byte* encodedMessage, String uidString) {
         Serial.println("SPOOL-ID gefunden: " + doc["sm_id"].as<String>());
         activeSpoolId = doc["sm_id"].as<String>();
         lastSpoolId = activeSpoolId;
+        noteAmsSpoolReadEvent();
       }
       else if(doc["location"].is<String>() && doc["location"] != "")
       {
@@ -1321,21 +1774,21 @@ bool readCompleteJsonForFastPath() {
     // Read all pages
     uint8_t numPages = tagSize / 4;
     for (uint8_t i = 4; i < 4 + numPages; i++) {
-        if (!robustPageRead(i, data + (i - 4) * 4)) {
-            Serial.printf("FAST-PATH: Failed to read page %d\n", i);
-            free(data);
-            return false;
-        }
-        
-        // Check for NDEF message end
-        if (data[(i - 4) * 4] == 0xFE) {
-            Serial.println("FAST-PATH: Found NDEF message end marker");
-            break;
-        }
-        
-        yield();
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(2));
+      if (!robustPageRead(i, data + (i - 4) * 4)) {
+        Serial.printf("FAST-PATH: Failed to read page %d\n", i);
+        free(data);
+        return false;
+      }
+
+      // Check for NDEF message end
+      if (data[(i - 4) * 4] == 0xFE) {
+        Serial.println("FAST-PATH: Found NDEF message end marker");
+        break;
+      }
+
+      yield();
+      esp_task_wdt_reset();
+      vTaskDelay(pdMS_TO_TICKS(2));
     }
     
     // Decode NDEF and extract JSON
@@ -1545,6 +1998,7 @@ bool quickSpoolIdCheck(String uidString) {
                 // Set as active spool immediately
                 activeSpoolId = quickSpoolId;
                 lastSpoolId = activeSpoolId;
+                noteAmsSpoolReadEvent();
                 
                 // Read complete JSON data for web interface display
                 Serial.println("FAST-PATH: Reading complete JSON data for web interface...");
@@ -1591,6 +2045,7 @@ void writeJsonToTag(void *parameter) {
 
   nfcReaderState = NFC_WRITING;
   nfcWriteInProgress = true; // Block high-level tag operations during write
+  setLedDefaultPattern(LED_PATTERN_PREPARE_WRITE);
 
   // Do NOT suspend the reading task - we need NFC interface for verification
   // Just use nfcWriteInProgress to prevent scanning and fast-path operations
@@ -1604,19 +2059,20 @@ void writeJsonToTag(void *parameter) {
   // Show waiting message for tag detection
   oledShowProgressBar(0, 1, "Write Tag", "Warte auf Tag");
   
-  // Wait 10sec for tag
+  const unsigned long writeWaitDeadline = WRITE_QUEUE_TIMEOUT_MS;
+  unsigned long writeWaitStart = millis();
   uint8_t success = 0;
   String uidString = "";
-  for (uint16_t i = 0; i < 20; i++) {
+  bool writeTimeout = false;
+
+  while (((millis() - writeWaitStart) < writeWaitDeadline)) {
     uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
     uint8_t uidLength;
-    // yield before potentially waiting for 400ms
     yield();
     esp_task_wdt_reset();
     success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 400);
     if (success) {
       for (uint8_t i = 0; i < uidLength; i++) {
-        //TBD: Rework to remove all the string operations
         uidString += String(uid[i], HEX);
         if (i < uidLength - 1) {
             uidString += ":"; // Optional: Trennzeichen hinzufügen
@@ -1628,7 +2084,11 @@ void writeJsonToTag(void *parameter) {
 
     yield();
     esp_task_wdt_reset();
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
+
+  if (!success && ((millis() - writeWaitStart) >= writeWaitDeadline)) {
+    writeTimeout = true;
   }
 
   if (success)
@@ -1636,9 +2096,11 @@ void writeJsonToTag(void *parameter) {
     oledShowProgressBar(1, 3, "Write Tag", "Writing");
 
     // Schreibe die NDEF-Message auf den Tag
+    setLedDefaultPattern(LED_PATTERN_WRITING);
     success = ntag2xx_WriteNDEF(params->payload);
     if (success) 
     {
+      triggerLedPattern(LED_PATTERN_WRITE_SUCCESS, 1500);
         Serial.println("NDEF-Message erfolgreich auf den Tag geschrieben");
         //oledShowMessage("NFC-Tag written");
         //vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1693,7 +2155,7 @@ void writeJsonToTag(void *parameter) {
         uint8_t uidLength;
         int tagRemovalChecks = 0;
         
-        Serial.println("Warte bis Tag entfernt wird...");
+        Serial.println("Waiting for tag removal...");
         
         // Monitor tag presence
         while (tagRemovalChecks < 10) {
@@ -1703,7 +2165,7 @@ void writeJsonToTag(void *parameter) {
           bool tagPresent = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 500);
           
           if (!tagPresent) {
-            Serial.println("✓ Tag wurde entfernt - NFC bereit für nächsten Scan");
+            Serial.println("✓ Tag removed - NFC ready for next scan");
             break;
           }
           
@@ -1759,6 +2221,7 @@ void writeJsonToTag(void *parameter) {
     } 
     else 
     {
+      triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 1500);
         Serial.println("Fehler beim Schreiben der NDEF-Message auf den Tag");
         oledShowIcon("failed");
         vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -1768,7 +2231,12 @@ void writeJsonToTag(void *parameter) {
   else
   {
     Serial.println("Fehler: Kein Tag zu schreiben gefunden.");
-    oledShowProgressBar(1, 1, "Failure!", "No tag found");
+    if (writeTimeout) {
+      oledShowProgressBar(1, 1, "Failure!", "Write timeout");
+      Serial.println("Write queue aborted - tag was not presented within timeout");
+    } else {
+      oledShowProgressBar(1, 1, "Failure!", "No tag found");
+    }
     vTaskDelay(2000 / portTICK_PERIOD_MS);
     nfcReaderState = NFC_IDLE;
   }
@@ -1778,6 +2246,9 @@ void writeJsonToTag(void *parameter) {
 
   // Only reset the write protection flag - reading task was never suspended
   nfcWriteInProgress = false; // Re-enable high-level tag operations
+  writeWorkerActive = false;
+  queueOverwriteConfirmation = false;
+  updateQueueLedState();
   pauseBambuMqttTask = false;
 
   free(params->payload);
@@ -1833,57 +2304,302 @@ String optimizeJsonForFastPath(const char* payload) {
     return optimizedJson;
 }
 
+    static void ensureWriteQueueInit() {
+      if (writeQueueMutex == NULL) {
+        writeQueueMutex = xSemaphoreCreateMutex();
+      }
+    }
+
+    static String extractSmId(const char* payload) {
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        return "";
+      }
+      if (doc["sm_id"].is<String>()) {
+        return doc["sm_id"].as<String>();
+      }
+      if (doc["sm_id"].is<int>()) {
+        return String(doc["sm_id"].as<int>());
+      }
+      return "";
+    }
+
+    static size_t getWriteQueueSize() {
+      ensureWriteQueueInit();
+      size_t size = 0;
+      if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+        size = writeQueue.size();
+        xSemaphoreGive(writeQueueMutex);
+      }
+      return size;
+    }
+
+    static String peekWriteQueueSmId() {
+      ensureWriteQueueInit();
+      String spoolId = "";
+      if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+        if (!writeQueue.empty()) {
+          spoolId = writeQueue.front()->spoolId;
+        }
+        xSemaphoreGive(writeQueueMutex);
+      }
+      return spoolId;
+    }
+
+    static void updateQueueLedState() {
+      if (writeWorkerActive) {
+        return;
+      }
+      if (getWriteQueueSize() > 0) {
+        setLedDefaultPattern(LED_PATTERN_WRITE_QUEUE);
+      } else if (!nfcWriteInProgress) {
+        setLedDefaultPattern(LED_PATTERN_SEARCHING);
+      }
+    }
+
+    static void abortPendingQueueEntry(const char* reason) {
+      ensureWriteQueueInit();
+      WriteQueueEntry* entry = NULL;
+      if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+        if (!writeQueue.empty()) {
+          entry = writeQueue.front();
+          writeQueue.pop_front();
+        }
+        xSemaphoreGive(writeQueueMutex);
+      }
+      if (entry != NULL) {
+        if (reason != NULL) {
+          oledShowProgressBar(1, 1, "Failure", reason);
+          triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 1500);
+        }
+        free(entry->payload);
+        delete entry;
+      }
+      queueOverwriteConfirmation = false;
+      queueConfirmationStartMs = 0;
+      updateQueueLedState();
+    }
+
+    static void checkWriteQueueConfirmationTimeout() {
+      if (!queueOverwriteConfirmation || queueConfirmationStartMs == 0) {
+        return;
+      }
+      if ((millis() - queueConfirmationStartMs) >= WRITE_QUEUE_TIMEOUT_MS) {
+        Serial.println("Queued overwrite confirmation timed out");
+        abortPendingQueueEntry("Confirm timeout");
+      }
+    }
+
+    static void noteAmsSpoolReadEvent() {
+      lastAmsSpoolReadEventMs = millis();
+    }
+
+    static void armAmsReadWatchdog() {
+      amsReadWatchdogStartMs = millis();
+      amsReadWatchdogArmed = true;
+      lastAmsSpoolReadEventMs = 0;
+      Serial.println("AMS read watchdog armed");
+    }
+
+    static void disarmAmsReadWatchdog() {
+      amsReadWatchdogArmed = false;
+      Serial.println("AMS read watchdog disarmed");
+    }
+
+    static bool handleAmsReadTimeout() {
+      if (!amsReadWatchdogArmed || nfcReaderState != NFC_READING) {
+        return false;
+      }
+      if (lastAmsSpoolReadEventMs >= amsReadWatchdogStartMs) {
+        return false;
+      }
+      if ((millis() - amsReadWatchdogStartMs) < AMS_READ_TIMEOUT_MS) {
+        return false;
+      }
+      Serial.println("AMS spool read timeout detected");
+      oledShowProgressBar(1, 1, "Failure", "AMS read timeout");
+      triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 1500);
+      nfcJsonData = "";
+      activeSpoolId = "";
+      nfcReaderState = NFC_READ_ERROR;
+      setLedDefaultPattern(LED_PATTERN_SEARCHING);
+      disarmAmsReadWatchdog();
+      return true;
+    }
+
+    static void enqueueWriteRequest(bool isSpoolTag, const char* payload) {
+      ensureWriteQueueInit();
+      WriteQueueEntry* entry = new WriteQueueEntry();
+      entry->isSpoolTag = isSpoolTag;
+      entry->payload = strdup(payload);
+      entry->spoolId = extractSmId(payload);
+      bool wasEmpty = true;
+      if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+        wasEmpty = writeQueue.empty();
+        writeQueue.push_back(entry);
+        xSemaphoreGive(writeQueueMutex);
+      }
+      queueOverwriteConfirmation = false;
+      Serial.printf("Queued NFC write request (pending: %d)\n", (int)getWriteQueueSize());
+      if (!writeWorkerActive && wasEmpty) {
+        updateQueueLedState();
+      }
+    }
+
+    static void startNextWriteFromQueue() {
+      if (writeWorkerActive) {
+        return;
+      }
+      ensureWriteQueueInit();
+      WriteQueueEntry* entry = NULL;
+      if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+        if (!writeQueue.empty()) {
+          entry = writeQueue.front();
+          writeQueue.pop_front();
+        }
+        xSemaphoreGive(writeQueueMutex);
+      }
+      if (entry == NULL) {
+        updateQueueLedState();
+        return;
+      }
+
+      NfcWriteParameterType* params = new NfcWriteParameterType();
+      params->tagType = entry->isSpoolTag;
+      params->payload = entry->payload;
+      delete entry;
+
+      writeWorkerActive = true;
+      queueOverwriteConfirmation = false;
+
+      BaseType_t result = xTaskCreate(
+        writeJsonToTag,
+        "WriteJsonToTagTask",
+        5115,
+        (void*)params,
+        rfidWriteTaskPrio,
+        NULL);
+
+      if (result != pdPASS) {
+        Serial.println("Failed to start NFC write task - requeueing request");
+        if (xSemaphoreTake(writeQueueMutex, portMAX_DELAY) == pdTRUE) {
+          WriteQueueEntry* retry   = new WriteQueueEntry();
+          retry->isSpoolTag = params->tagType;
+          retry->payload = params->payload;
+          retry->spoolId = extractSmId(retry->payload);
+          writeQueue.push_front(retry);
+          xSemaphoreGive(writeQueueMutex);
+        }
+        writeWorkerActive = false;
+        delete params;
+        updateQueueLedState();
+        return;
+      }
+    }
+
+    static void handleWriteQueueForTag(const String& detectedSmId) {
+      if (writeWorkerActive) {
+        return;
+      }
+      if (getWriteQueueSize() == 0) {
+        return;
+      }
+
+      String nextSmId = peekWriteQueueSmId();
+      if (nextSmId.length() > 0 && detectedSmId.length() > 0 && nextSmId.equalsIgnoreCase(detectedSmId)) {
+        if (!queueOverwriteConfirmation) {
+          queueOverwriteConfirmation = true;
+          queueConfirmationStartMs = millis();
+          Serial.println("Queued tag matches existing spool - tap again to confirm overwrite");
+          oledShowProgressBar(1, 1, "Write Tag", "Confirm overwrite");
+          triggerLedPattern(LED_PATTERN_TAG_FOUND, 1200);
+          return;
+        }
+      }
+
+      queueOverwriteConfirmation = false;
+      queueConfirmationStartMs = 0;
+      startNextWriteFromQueue();
+    }
+
 void startWriteJsonToTag(const bool isSpoolTag, const char* payload) {
-  // Optimize JSON to ensure sm_id is first key for fast-path detection
   String optimizedPayload = optimizeJsonForFastPath(payload);
-  
-  NfcWriteParameterType* parameters = new NfcWriteParameterType();
-  parameters->tagType = isSpoolTag;
-  parameters->payload = strdup(optimizedPayload.c_str()); // Use optimized payload
-  
-  // Task nicht mehrfach starten
+  enqueueWriteRequest(isSpoolTag, optimizedPayload.c_str());
   if (nfcReaderState == NFC_IDLE || nfcReaderState == NFC_READ_ERROR || nfcReaderState == NFC_READ_SUCCESS) {
-    oledShowProgressBar(0, 1, "Write Tag", "Place tag now");
-    // Erstelle die Task
-    xTaskCreate(
-        writeJsonToTag,        // Task-Funktion
-        "WriteJsonToTagTask",       // Task-Name
-        5115,                        // Stackgröße in Bytes
-        (void*)parameters,         // Parameter
-        rfidWriteTaskPrio,           // Priorität
-        NULL                         // Task-Handle (nicht benötigt)
-    );
-  }else{
-    oledShowProgressBar(0, 1, "FAILURE", "NFC busy!");
-    // TBD: Add proper error handling (website)
+    oledShowProgressBar(0, 1, "Write Tag", "Queued tag");
+  } else {
+    oledShowProgressBar(0, 1, "Write Tag", "Queued tag");
   }
+  updateQueueLedState();
 }
 
 // Safe tag detection with manual retry logic and short timeouts
 bool safeTagDetection(uint8_t* uid, uint8_t* uidLength) {
     const int MAX_ATTEMPTS = 3;
-    const int SHORT_TIMEOUT = 100; // Very short timeout to prevent hanging
+  const int SHORT_TIMEOUT = 400; // Increase timeout to improve tag read reliability
     
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        // Watchdog reset on each attempt
-        esp_task_wdt_reset();
-        yield();
-        
-        // Use short timeout to avoid blocking
-        bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, uidLength, SHORT_TIMEOUT);
+      // Watchdog reset on each attempt
+      esp_task_wdt_reset();
+      yield();
+      // Ensure antenna is on before detection attempt
+    #ifdef USE_RC522
+      rfid.PCD_AntennaOn();
+
+      // Only print attempt diagnostics when PICC presence is detected
+      bool prelim = rfid.PICC_IsNewCardPresent();
+      if (prelim && kNfcDiagnosticsEnabled) {
+        byte vr = rfid.PCD_ReadRegister(rfid.VersionReg);
+        Serial.print("[DBG] safeTagDetection attempt "); Serial.print(attempt+1);
+        Serial.print(" VersionReg=0x"); Serial.print(vr, HEX);
+        Serial.print(" PICC_IsNewCardPresent="); Serial.print(prelim);
+        Serial.println();
+      }
+    #else
+      // For PN532 just ensure SAM is configured (no explicit antenna control)
+      nfc.SAMConfig();
+    #endif
+
+      // Use timeout to wait for tag
+      bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, uidLength, SHORT_TIMEOUT);
         
         if (success) {
-            Serial.printf("✓ Tag detected on attempt %d with %dms timeout\n", attempt + 1, SHORT_TIMEOUT);
+            if (kNfcDiagnosticsEnabled) {
+              Serial.printf("✓ Tag detected on attempt %d with %dms timeout\n", attempt + 1, SHORT_TIMEOUT);
+            }
             return true;
         }
         
         // Short pause between attempts
         vTaskDelay(pdMS_TO_TICKS(25));
         
-        // Refresh RF field after failed attempt (but not on last attempt)
+        // Refresh RF field after failed attempt (do heavier diagnostics only on last attempt)
         if (attempt < MAX_ATTEMPTS - 1) {
-            nfc.SAMConfig();
-            vTaskDelay(pdMS_TO_TICKS(10));
+          // Reconfigure SAM briefly to refresh RF field
+          nfc.SAMConfig();
+          vTaskDelay(pdMS_TO_TICKS(10));
+#ifdef USE_RC522
+          // Try a soft reset of the RC522 hardware registers without dumping registers
+          rfid.PCD_Reset();
+          vTaskDelay(pdMS_TO_TICKS(20));
+          rfid.PCD_Init(); // Re-init to restore timer/modulation settings
+          rfid.PCD_SetAntennaGain(rfid.RxGain_43dB); // Restore gain
+          // rfid.PCD_AntennaOn(); // PCD_Init enables antenna
+#endif
+        } else {
+          // On final failure do a single register dump for diagnostics
+          nfc.SAMConfig();
+          vTaskDelay(pdMS_TO_TICKS(10));
+#ifdef USE_RC522
+          if (kNfcDiagnosticsEnabled) {
+            nfc.dumpRegisters("safeTagDetection after SAMConfig");
+          }
+          rfid.PCD_Reset();
+          // give the chip a bit more time here before re-enabling the antenna
+          vTaskDelay(pdMS_TO_TICKS(150));
+          rfid.PCD_AntennaOn();
+#endif
         }
     }
     
@@ -1892,13 +2608,87 @@ bool safeTagDetection(uint8_t* uid, uint8_t* uidLength) {
 
 void scanRfidTask(void * parameter) {
   Serial.println("RFID Task gestartet");
+  
+  // Wait for boot to complete
+  while(booting) {
+    Serial.println("Waiting for boot to complete...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  Serial.println("Boot complete, NFC scanning starting");
+  
   for(;;) {
     // Regular watchdog reset
     esp_task_wdt_reset();
     yield();
+
+    checkWriteQueueConfirmationTimeout();
+
+        // Quick sample diagnostics every 1s to help when no tags are being detected
+        static unsigned long lastQuickSample = 0;
+        if (millis() - lastQuickSample > 1000) {
+      lastQuickSample = millis();
+    #ifdef USE_RC522
+      if (kNfcDiagnosticsEnabled) {
+        byte vs = rfid.PCD_ReadRegister(rfid.VersionReg);
+        bool pres = rfid.PICC_IsNewCardPresent();
+        Serial.print("[SAMPLE] VersionReg=0x"); Serial.print(vs, HEX);
+        Serial.print(" present="); Serial.println(pres);
+      }
+    #endif
+        }
+
+    // Periodic diagnostic output when idle to help debug no-activity issues
+    static unsigned long lastDiag = 0;
+    unsigned long now = millis();
+    if (now - lastDiag > 5000) { // every 5 seconds
+      lastDiag = now;
+      if (kNfcDiagnosticsEnabled) {
+        Serial.print("[DIAG] nfcReaderState="); Serial.print((int)nfcReaderState);
+        Serial.print(" writeInProgress="); Serial.print(nfcWriteInProgress);
+        Serial.print(" suspendReq="); Serial.print(nfcReadingTaskSuspendRequest);
+        Serial.print(" suspendState="); Serial.println(nfcReadingTaskSuspendState);
+      }
+
+#ifdef USE_RC522
+      // quick hardware presence check (non-blocking)
+      byte v = rfid.PCD_ReadRegister(rfid.VersionReg);
+      unsigned long _now = millis();
+      if (v != rc522LastVersion) {
+        if (kNfcDiagnosticsEnabled) {
+          Serial.print("[DIAG] RC522 VersionReg=0x"); Serial.println(v, HEX);
+        }
+        rc522LastVersion = v;
+        rc522LastVersionTS = _now;
+      } else if (_now - rc522LastVersionTS > rc522HeartbeatInterval) {
+        if (kNfcDiagnosticsEnabled) {
+          Serial.print("[DIAG] RC522 Heartbeat VersionReg=0x"); Serial.println(v, HEX);
+        }
+        rc522LastVersionTS = _now;
+      }
+
+      // If the RC522 returns 0x00 repeatedly it may have dropped off the SPI bus.
+      // Try reinitializing the RC522 automatically after a few consecutive zeros.
+      static int rc522ZeroCount = 0;
+      if (v == 0x00) {
+        rc522ZeroCount++;
+      } else {
+        rc522ZeroCount = 0;
+      }
+
+      if (rc522ZeroCount >= 3) {
+        if (kNfcDiagnosticsEnabled) {
+          Serial.println("[WARN] RC522 VersionReg stuck at 0x00 — attempting reinit...");
+        }
+        // Call high-level begin which performs reset, fallback SPI and PCD_Init
+        nfc.begin();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        rc522ZeroCount = 0;
+      }
+#endif
+    }
     
     // Skip scanning during write operations, but keep NFC interface active
-    if (nfcReaderState != NFC_WRITING && !nfcWriteInProgress && !nfcReadingTaskSuspendRequest && !booting)
+    if (nfcReaderState != NFC_WRITING && !nfcWriteInProgress && !nfcReadingTaskSuspendRequest)
     {
       nfcReadingTaskSuspendState = false;
       yield();
@@ -1927,6 +2717,10 @@ void scanRfidTask(void * parameter) {
         Serial.println("Found an ISO14443A card");
 
         nfcReaderState = NFC_READING;
+        armAmsReadWatchdog();
+        if (handleAmsReadTimeout()) {
+          continue;
+        }
 
         oledShowProgressBar(0, octoEnabled?5:4, "Reading", "Detecting tag");
 
@@ -1944,21 +2738,92 @@ void scanRfidTask(void * parameter) {
           }
         }
         
+        // ONE-SHOT DEBUG: Print concise UID and pages 3/4 (single line per detection)
+        {
+          uint8_t p3[4] = {0,0,0,0};
+          uint8_t p4[4] = {0,0,0,0};
+          bool p3ok = nfc.ntag2xx_ReadPage(3, p3);
+          bool p4ok = nfc.ntag2xx_ReadPage(4, p4);
+
+          Serial.print("[ONE-SHOT] UID=");
+          for (uint8_t i = 0; i < uidLength; i++) {
+            if (uid[i] < 0x10) Serial.print("0");
+            Serial.print(uid[i], HEX);
+            if (i < uidLength - 1) Serial.print(" ");
+          }
+          Serial.print(" | P3=");
+          if (p3ok) {
+            for (int j = 0; j < 4; j++) {
+              if (p3[j] < 0x10) Serial.print("0");
+              Serial.print(p3[j], HEX);
+            }
+          } else {
+            Serial.print("ERR");
+          }
+          Serial.print(" | P4=");
+          if (p4ok) {
+            for (int j = 0; j < 4; j++) {
+              if (p4[j] < 0x10) Serial.print("0");
+              Serial.print(p4[j], HEX);
+            }
+          } else {
+            Serial.print("ERR");
+          }
+          Serial.println();
+        }
         if (uidLength == 7)
         {
+          bool amsTimeout = false;
           // Try fast-path detection first for known spools
-          if (quickSpoolIdCheck(uidString)) {
+            if (quickSpoolIdCheck(uidString)) {
               Serial.println("✓ FAST-PATH: Tag processed quickly, skipping full read");
               pauseBambuMqttTask = false;
               // Set reader back to idle for next scan
+              triggerLedPattern(LED_PATTERN_TAG_FOUND, 1200);
               nfcReaderState = NFC_READ_SUCCESS;
-              delay(500); // Small delay before next scan
+              handleWriteQueueForTag(activeSpoolId);
+              // Try to queue tag for AMS tray assignment if empty tray available
+              tryQueueTagForAmsTray();
+              disarmAmsReadWatchdog();
+      #ifdef USE_RC522
+              // Ensure tag is halted and MFRC522 crypto stopped so new tags can be detected
+              rfid.PICC_HaltA();
+              rfid.PCD_StopCrypto1();
+              rfid.uid.size = 0;
+              Serial.println("[CLEANUP] Fast-path: halted tag and cleared UID");
+              // Force a soft-reset + RF field toggle to ensure the RC522
+              // fully releases the tag and is ready for the next one.
+              rfid.PCD_Reset();
+              rfid.PCD_AntennaOff();
+              // Give the RF field time to collapse so the card truly leaves the field
+              vTaskDelay(pdMS_TO_TICKS(200));
+              rfid.PCD_AntennaOn();
+              // Re-init the RC522 to ensure internal state is cleared
+              rfid.PCD_Init();
+              // Allow the reader to stabilise after init
+              vTaskDelay(pdMS_TO_TICKS(150));
+              rfid.uid.size = 0;
+              Serial.println("[CLEANUP] Fast-path: forced reset, antenna toggle and re-init (long)");
+              // As a last-resort, perform a hardware-level power-cycle to ensure
+              // the RC522 internal state is fully cleared and the RF field is
+              // truly removed. This is heavy-handed but can fix modules that
+              // refuse to detect a subsequent tag.
+              nfc.hardwarePowerCycle();
+              delay(600); // Small delay before next scan
+      #else
+              // PN532 minimal cleanup: reconfigure SAM to refresh interface
+              nfc.SAMConfig();
+              vTaskDelay(pdMS_TO_TICKS(50));
+      #endif
               continue; // Skip full tag reading and continue scan loop
-          }
+            }
 
           Serial.println("Continuing with full tag read after fast-path check");
 
           uint16_t tagSize = readTagSize();
+          if (handleAmsReadTimeout()) {
+            continue;
+          }
           if(tagSize > 0)
           {
             // Create a buffer depending on the size of the tag
@@ -1974,6 +2839,10 @@ void scanRfidTask(void * parameter) {
             uint8_t numPages = readTagSize()/4;
             
             for (uint8_t i = 4; i < 4+numPages; i++) {
+              if (handleAmsReadTimeout()) {
+                amsTimeout = true;
+                break;
+              }
               
               if (!robustPageRead(i, data+(i-4) * 4))
               {
@@ -1999,18 +2868,55 @@ void scanRfidTask(void * parameter) {
             if (!decodeNdefAndReturnJson(data, uidString)) 
             {
               oledShowProgressBar(1, 1, "Failure", "Unknown tag");
+              triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 1200);
               nfcReaderState = NFC_READ_ERROR;
             }
             else 
             {
+              triggerLedPattern(LED_PATTERN_TAG_FOUND, 1200);
               nfcReaderState = NFC_READ_SUCCESS;
+              handleWriteQueueForTag(activeSpoolId);
+              // Try to queue tag for AMS tray assignment if empty tray available
+              tryQueueTagForAmsTray();
             }
 
-            free(data);
+            free(data);;
+            // After finishing reading and processing, perform cleanup so the
+            // reader is ready to detect new tags. RC522 requires a heavier
+            // sequence; PN532 can use a lighter approach.
+#ifdef USE_RC522
+            // Halt tag and stop crypto for MFRC522
+            rfid.PICC_HaltA();
+            rfid.PCD_StopCrypto1();
+            rfid.uid.size = 0;
+            Serial.println("[CLEANUP] Full-read: halted tag and cleared UID");
+            // Force a soft-reset + RF field toggle to ensure the RC522
+            // fully releases the tag and is ready for the next one.
+            rfid.PCD_Reset();
+            rfid.PCD_AntennaOff();
+            // Give the RF field time to collapse so the card truly leaves the field
+            vTaskDelay(pdMS_TO_TICKS(200));
+            rfid.PCD_AntennaOn();
+            // Re-init the RC522 to ensure internal state is cleared
+            rfid.PCD_Init();
+            // Allow the reader to stabilise after init
+            vTaskDelay(pdMS_TO_TICKS(150));
+            rfid.uid.size = 0;
+            Serial.println("[CLEANUP] Full-read: forced reset, antenna toggle and re-init (long)");
+            // As a last-resort, perform a hardware-level power-cycle to ensure
+            // the RC522 internal state is fully cleared and the RF field is
+            // truly removed.
+            nfc.hardwarePowerCycle();
+#else
+            // PN532 minimal cleanup
+            nfc.SAMConfig();
+            vTaskDelay(pdMS_TO_TICKS(50));
+#endif
           }
           else
           {
             oledShowProgressBar(1, 1, "Failure", "Tag read error");
+            triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 1200);
             nfcReaderState = NFC_READ_ERROR;
             // Reset activeSpoolId when tag reading fails to prevent autoSet
             activeSpoolId = "";
@@ -2026,6 +2932,9 @@ void scanRfidTask(void * parameter) {
           activeSpoolId = "";
           Serial.println("Unknown tag type - activeSpoolId reset to prevent autoSet");
         }
+        if (amsReadWatchdogArmed) {
+          disarmAmsReadWatchdog();
+        }
       }
 
       if (!success && nfcReaderState != NFC_IDLE && !nfcReadingTaskSuspendRequest)
@@ -2034,14 +2943,15 @@ void scanRfidTask(void * parameter) {
         //uidString = "";
         nfcJsonData = "";
         activeSpoolId = "";
-        Serial.println("Tag entfernt");
+        Serial.println("Tag removed");
+        updateQueueLedState();
         if (!bambuCredentials.autosend_enable) oledShowWeight(weight);
       }
       // Reset state after successful read when tag is removed
       else if (!success && nfcReaderState == NFC_READ_SUCCESS)
       {
         nfcReaderState = NFC_IDLE;
-        Serial.println("Tag nach erfolgreichem Lesen entfernt - bereit für nächsten Tag");
+        Serial.println("Tag read successfully - ready for next scan");
       }
 
       // Add a pause after successful reading to prevent immediate re-reading
@@ -2077,39 +2987,51 @@ void scanRfidTask(void * parameter) {
 
 void startNfc() {
   oledShowProgressBar(5, 7, DISPLAY_BOOT_TEXT, "NFC init");
-  nfc.begin();                                           // Beginne Kommunikation mit RFID Leser
-  delay(1000);
-  unsigned long versiondata = nfc.getFirmwareVersion();  // Lese Versionsnummer der Firmware aus
-  if (! versiondata) {                                   // Wenn keine Antwort kommt
-    Serial.println("Kann kein RFID Board finden !");            // Sende Text "Kann kein..." an seriellen Monitor
+  Serial.println("NFC: begin() start");
+  esp_task_wdt_reset();
+  nfc.begin();                                           // Begin communication with NFC reader
+  esp_task_wdt_reset();
+  delay(500);
+  Serial.println("NFC: begin() done");
+
+#ifndef USE_RC522
+  Serial.println("NFC: getFirmwareVersion() start");
+  esp_task_wdt_reset();
+  unsigned long versiondata = nfc.getFirmwareVersion();  // Read firmware version
+  esp_task_wdt_reset();
+  Serial.println("NFC: getFirmwareVersion() done");
+  if (!versiondata) {
+    Serial.println("Cannot find RFID board!");
     oledShowMessage("No RFID Board found");
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
-  }
-  else {
-    Serial.print("Chip PN5 gefunden"); Serial.println((versiondata >> 24) & 0xFF, HEX); // Sende Text und Versionsinfos an seriellen
-    Serial.print("Firmware ver. "); Serial.print((versiondata >> 16) & 0xFF, DEC);      // Monitor, wenn Antwort vom Board kommt
-    Serial.print('.'); Serial.println((versiondata >> 8) & 0xFF, DEC);                  // 
-
-    nfc.SAMConfig();
-    // Set the max number of retry attempts to read from a card
-    // This prevents us from waiting forever for a card, which is
-    // the default behaviour of the PN532.
-    //nfc.setPassiveActivationRetries(0x7F);
-    //nfc.setPassiveActivationRetries(0xFF);
-
-    BaseType_t result = xTaskCreatePinnedToCore(
-      scanRfidTask, /* Function to implement the task */
-      "RfidReader", /* Name of the task */
-      5115,  /* Stack size in words */
-      NULL,  /* Task input parameter */
-      rfidTaskPrio,  /* Priority of the task */
-      &RfidReaderTask,  /* Task handle. */
-      rfidTaskCore); /* Core where the task should run */
-
-      if (result != pdPASS) {
-        Serial.println("Fehler beim Erstellen des RFID Tasks");
-    } else {
-        Serial.println("RFID Task erfolgreich erstellt");
+    // break the long delay into smaller intervals while petting WDT
+    for (int i = 0; i < 4; ++i) {
+      esp_task_wdt_reset();
+      vTaskDelay(500 / portTICK_PERIOD_MS);
     }
+    return;
+  }
+
+  Serial.print("Chip PN5 gefunden"); Serial.println((versiondata >> 24) & 0xFF, HEX);
+  Serial.print("Firmware ver. "); Serial.print((versiondata >> 16) & 0xFF, DEC);
+  Serial.print('.'); Serial.println((versiondata >> 8) & 0xFF, DEC);
+  nfc.SAMConfig();
+#else
+  Serial.println("RC522 initialized (SPI)");
+  nfc.SAMConfig();
+#endif
+
+  BaseType_t result = xTaskCreatePinnedToCore(
+    scanRfidTask,
+    "RfidReader",
+    5115,
+    NULL,
+    rfidTaskPrio,
+    &RfidReaderTask,
+    rfidTaskCore);
+
+  if (result != pdPASS) {
+    Serial.println("Fehler beim Erstellen des RFID Tasks");
+  } else {
+    Serial.println("RFID Task erfolgreich erstellt");
   }
 }

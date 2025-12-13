@@ -1,6 +1,5 @@
 #include "bambu.h"
 #include <ArduinoJson.h>
-#include <PubSubClient.h>
 #include <WiFiManager.h>
 #include <SSLClient.h>
 #include "bambu_cert.h"
@@ -10,11 +9,19 @@
 #include "esp_task_wdt.h"
 #include "config.h"
 #include "display.h"
+#include "led.h"
 #include <Preferences.h>
+#include "mqtt_helpers.h"
 
+#ifndef ASYNC_MQTT
+#include <PubSubClient.h>
 WiFiClient espClient;
 SSLClient sslClient(&espClient);
 PubSubClient client(sslClient);
+#else
+#include "mqtt_adapter.h"
+#endif
+
 
 TaskHandle_t BambuMqttTask;
 
@@ -24,11 +31,22 @@ bool bambu_connected = false;
 uint16_t autoSetToBambuSpoolId = 0;
 
 BambuCredentials bambuCredentials;
+SemaphoreHandle_t amsDataMutex = NULL;
 
 // Globale Variablen für AMS-Daten
 int ams_count = 0;
 String amsJsonData;  // Speichert das fertige JSON für WebSocket-Clients
 AMSData ams_data[MAX_AMS];  // Definition des Arrays;
+
+// Pending tray assignment for auto-fill feature
+// Fields: tagData, manufacturer, material, brandName, color, dryingTemp, dryingTime, nozzle_temp_min, nozzle_temp_max, queuedTime, valid
+PendingTrayAssignment pendingTrayAssignment = {"", "", "", "", "", 0, 0, 0, 0, 0, false};
+#define TRAY_ASSIGNMENT_TIMEOUT_MS 120000  // 2 minute timeout
+
+// Track empty trays to detect when they get filled
+static uint8_t emptyTrayAmsId = 255;
+static uint8_t emptyTrayId = 255;
+static bool trackingEmptyTray = false;
 
 bool removeBambuCredentials() {
     if (BambuMqttTask) {
@@ -344,15 +362,182 @@ void autoSetSpool(int spoolId, uint8_t trayId) {
     autoSetToBambuSpoolId = 0;
 }
 
+// ============= Empty Tray Detection and Auto-Assignment Functions =============
+
+bool hasEmptyAmsTray() {
+    for (int i = 0; i < ams_count; i++) {
+        // Skip external spool (ams_id 255)
+        if (ams_data[i].ams_id == 255) continue;
+        
+        int maxTrays = 4;
+        for (int j = 0; j < maxTrays; j++) {
+            // Empty tray has empty tray_type
+            if (ams_data[i].trays[j].tray_type == "" || ams_data[i].trays[j].tray_type.length() == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool findEmptyAmsTray(uint8_t& amsId, uint8_t& trayId) {
+    for (int i = 0; i < ams_count; i++) {
+        // Skip external spool (ams_id 255)
+        if (ams_data[i].ams_id == 255) continue;
+        
+        int maxTrays = 4;
+        for (int j = 0; j < maxTrays; j++) {
+            // Empty tray has empty tray_type
+            if (ams_data[i].trays[j].tray_type == "" || ams_data[i].trays[j].tray_type.length() == 0) {
+                amsId = ams_data[i].ams_id;
+                trayId = ams_data[i].trays[j].id;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void queueTagForTrayAssignment(const String& tagData, const String& manufacturer, const String& material,
+                                const String& brandName, const String& color, int dryingTemp, int dryingTime,
+                                int tempMin, int tempMax) {
+    // Check if there's an empty tray to wait for
+    uint8_t amsId, trayId;
+    if (!findEmptyAmsTray(amsId, trayId)) {
+        // No empty tray - pulse red and return to normal
+        Serial.println("No empty AMS tray available for tag assignment");
+        triggerLedPattern(LED_PATTERN_NO_EMPTY_TRAY, 3000);
+        oledShowMessage("No empty tray");
+        return;
+    }
+    
+    // Queue the tag for assignment
+    pendingTrayAssignment.tagData = tagData;
+    pendingTrayAssignment.manufacturer = manufacturer;
+    pendingTrayAssignment.material = material;
+    pendingTrayAssignment.brandName = brandName;
+    pendingTrayAssignment.color = color;
+    pendingTrayAssignment.dryingTemp = dryingTemp;
+    pendingTrayAssignment.dryingTime = dryingTime;
+    pendingTrayAssignment.nozzle_temp_min = tempMin;
+    pendingTrayAssignment.nozzle_temp_max = tempMax;
+    pendingTrayAssignment.queuedTime = millis();
+    pendingTrayAssignment.valid = true;
+    
+    // Track which empty tray we're waiting for
+    emptyTrayAmsId = amsId;
+    emptyTrayId = trayId;
+    trackingEmptyTray = true;
+    
+    Serial.printf("Tag queued for tray assignment (AMS %d, Tray %d). Waiting for tray to be filled...\n", amsId, trayId);
+    setLedDefaultPattern(LED_PATTERN_AMS_WAITING);
+    oledShowMessage("Waiting for tray");
+}
+
+void clearPendingTrayAssignment() {
+    pendingTrayAssignment.tagData = "";
+    pendingTrayAssignment.manufacturer = "";
+    pendingTrayAssignment.material = "";
+    pendingTrayAssignment.brandName = "";
+    pendingTrayAssignment.color = "";
+    pendingTrayAssignment.dryingTemp = 0;
+    pendingTrayAssignment.dryingTime = 0;
+    pendingTrayAssignment.nozzle_temp_min = 0;
+    pendingTrayAssignment.nozzle_temp_max = 0;
+    pendingTrayAssignment.queuedTime = 0;
+    pendingTrayAssignment.valid = false;
+    trackingEmptyTray = false;
+    emptyTrayAmsId = 255;
+    emptyTrayId = 255;
+    
+    setLedDefaultPattern(LED_PATTERN_SEARCHING);
+}
+
+bool hasPendingTrayAssignment() {
+    return pendingTrayAssignment.valid;
+}
+
+void checkPendingTrayAssignment() {
+    if (!pendingTrayAssignment.valid) return;
+    
+    // Check for timeout (2 minutes)
+    if (millis() - pendingTrayAssignment.queuedTime >= TRAY_ASSIGNMENT_TIMEOUT_MS) {
+        Serial.println("Pending tray assignment timed out after 2 minutes");
+        oledShowMessage("Tray assign timeout");
+        clearPendingTrayAssignment();
+        return;
+    }
+}
+
+// Called when a tray changes from empty to filled
+void checkTrayFilled(uint8_t amsId, uint8_t trayId, bool isBambuSpool) {
+    if (!pendingTrayAssignment.valid || !trackingEmptyTray) return;
+    
+    // Check if this is the tray we're tracking
+    if (amsId != emptyTrayAmsId || trayId != emptyTrayId) return;
+    
+    Serial.printf("Tracked tray (AMS %d, Tray %d) has been filled\n", amsId, trayId);
+    
+    // If it's a Bambu spool, it will be auto-identified - don't override
+    if (isBambuSpool) {
+        Serial.println("Bambu spool detected - not overriding with queued tag data");
+        clearPendingTrayAssignment();
+        return;
+    }
+    
+    // Non-Bambu spool (generic/third-party) - assign from queued tag data
+    Serial.println("Non-Bambu spool detected - assigning from queued tag data");
+    
+    // Create payload for setBambuSpool
+    JsonDocument doc;
+    doc["amsId"] = amsId;
+    doc["trayId"] = trayId;
+    doc["color"] = pendingTrayAssignment.color;
+    doc["nozzle_temp_min"] = pendingTrayAssignment.nozzle_temp_min;
+    doc["nozzle_temp_max"] = pendingTrayAssignment.nozzle_temp_max;
+    doc["type"] = pendingTrayAssignment.material;
+    doc["brand"] = pendingTrayAssignment.manufacturer;  // Use manufacturer for brand field
+    doc["tray_info_idx"] = "-1";  // Let setBambuSpool find the correct index
+    doc["bambu_setting_id"] = "";
+    doc["cali_idx"] = "";
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    Serial.println("Auto-assigning queued tag to filled tray:");
+    Serial.println(payload);
+    
+    if (setBambuSpool(payload)) {
+        oledShowMessage("Tray assigned!");
+        triggerLedPattern(LED_PATTERN_WRITE_SUCCESS, 2000);
+    } else {
+        oledShowMessage("Assign failed");
+        triggerLedPattern(LED_PATTERN_WRITE_FAILURE, 2000);
+    }
+    
+    clearPendingTrayAssignment();
+}
+
+// ============= End Empty Tray Functions =============
+
 void updateAmsWsData(JsonDocument& doc, JsonArray& amsArray, int& ams_count, JsonObject& vtTray) {
     // Fortfahren mit der bestehenden Verarbeitung, da Änderungen gefunden wurden
-    ams_count = amsArray.size();
+    int normalAms = amsArray.size();
+    if (normalAms > MAX_AMS - 1) {
+        normalAms = MAX_AMS - 1; // Reserve one slot for the optional external spool
+    }
+    ams_count = normalAms;
         
-    for (int i = 0; i < ams_count && i < 16; i++) {
+    for (int i = 0; i < ams_count; i++) {
         JsonObject amsObj = amsArray[i];
         JsonArray trayArray = amsObj["tray"].as<JsonArray>();
 
-        ams_data[i].ams_id = i; // Setze die AMS-ID
+        // ams_data[i].ams_id = i; // Setze die AMS-ID
+        ams_data[i].ams_id = amsObj["id"].as<uint8_t>(); // Use the ID from JSON
+        
+        Serial.print("Processing AMS ID: ");
+        Serial.println(ams_data[i].ams_id);
+
         for (int j = 0; j < trayArray.size() && j < 4; j++) { // Annahme: Maximal 4 Trays pro AMS
             JsonObject trayObj = trayArray[j];
 
@@ -365,15 +550,17 @@ void updateAmsWsData(JsonDocument& doc, JsonArray& amsArray, int& ams_count, Jso
             ams_data[i].trays[j].nozzle_temp_max = trayObj["nozzle_temp_max"].as<int>();
             if (trayObj["tray_type"].as<String>() == "") ams_data[i].trays[j].setting_id = "";
             ams_data[i].trays[j].cali_idx = trayObj["cali_idx"].as<String>();
+            ams_data[i].trays[j].remain = trayObj["remain"].as<int>();
+            ams_data[i].trays[j].tray_uuid = trayObj["tray_uuid"].as<String>();
+            String uid = trayObj["tag_uid"].as<String>();
+            if (uid == "null") uid = "";
+            ams_data[i].trays[j].tag_uid = uid;
+            Serial.print("Tray "); Serial.print(j); Serial.print(" Tag UID: "); Serial.println(ams_data[i].trays[j].tag_uid);
         }
     }
     
-    // Setze ams_count auf die Anzahl der normalen AMS
-    ams_count = amsArray.size();
-
     // Wenn externe Spule vorhanden, füge sie hinzu
-    if (doc["print"]["vt_tray"].is<JsonObject>()) {
-        //JsonObject vtTray = doc["print"]["vt_tray"];
+    if (doc["print"]["vt_tray"].is<JsonObject>() && ams_count < MAX_AMS) {
         int extIdx = ams_count;  // Index für externe Spule
         ams_data[extIdx].ams_id = 255;  // Spezielle ID für externe Spule
         ams_data[extIdx].trays[0].id = 254;  // Spezielle ID für externes Tray
@@ -383,6 +570,11 @@ void updateAmsWsData(JsonDocument& doc, JsonArray& amsArray, int& ams_count, Jso
         ams_data[extIdx].trays[0].tray_color = vtTray["tray_color"].as<String>();
         ams_data[extIdx].trays[0].nozzle_temp_min = vtTray["nozzle_temp_min"].as<int>();
         ams_data[extIdx].trays[0].nozzle_temp_max = vtTray["nozzle_temp_max"].as<int>();
+        ams_data[extIdx].trays[0].remain = vtTray["remain"].as<int>();
+        ams_data[extIdx].trays[0].tray_uuid = vtTray["tray_uuid"].as<String>();
+        String uid = vtTray["tag_uid"].as<String>();
+        if (uid == "null") uid = "";
+        ams_data[extIdx].trays[0].tag_uid = uid;
 
         if (doc["print"]["vt_tray"]["tray_type"].as<String>() != "")
         {
@@ -419,27 +611,98 @@ void updateAmsWsData(JsonDocument& doc, JsonArray& amsArray, int& ams_count, Jso
             trayObj["nozzle_temp_max"] = ams_data[i].trays[j].nozzle_temp_max;
             trayObj["setting_id"] = ams_data[i].trays[j].setting_id;
             trayObj["cali_idx"] = ams_data[i].trays[j].cali_idx;
+            trayObj["remain"] = ams_data[i].trays[j].remain;
+            trayObj["tray_uuid"] = ams_data[i].trays[j].tray_uuid;
+            trayObj["tag_uid"] = ams_data[i].trays[j].tag_uid;
         }
     }
 
-    serializeJson(wsArray, amsJsonData);
+    if (amsDataMutex != NULL) {
+        if (xSemaphoreTake(amsDataMutex, portMAX_DELAY) == pdTRUE) {
+            amsJsonData = "";
+            serializeJson(wsArray, amsJsonData);
+            xSemaphoreGive(amsDataMutex);
+        }
+    } else {
+        amsJsonData = "";
+        serializeJson(wsArray, amsJsonData);
+    }
+
     wsDoc.clear();
-    Serial.println("AMS data updated");
+    Serial.print("AMS data updated. JSON length: ");
+    Serial.println(amsJsonData.length());
+    // Serial.println(amsJsonData);
     sendAmsData(nullptr);
 }
 
 // init
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-    String message;
+    // Log which topic and size
+    Serial.printf("MQTT Msg: %u bytes on %s\n", length, topic);
     
-    for (int i = 0; i < length; i++) {
-        message += (char)payload[i];
+    // Check if this is a REPORT message (which should have AMS data)
+    if (strstr(topic, "/report") != NULL) {
+        Serial.println("  [REPORT topic] This message should contain AMS data");
+    } else if (strstr(topic, "/request") != NULL) {
+        Serial.println("  [REQUEST topic] This is an echo/ack of our request");
+    }
+
+    static uint32_t lastMqttProcessTime = 0;
+    // Always process if we don't have data yet, otherwise throttle
+    if (ams_count > 0 && millis() - lastMqttProcessTime < 5000) {
+        return;  // Throttle within a poll session
+    }
+    
+    if (ESP.getFreeHeap() < 15000) {
+        Serial.printf("Low memory (%u), skipping MQTT processing\n", ESP.getFreeHeap());
+        return;
+    }
+
+    Serial.println("Processing MQTT message...");
+    lastMqttProcessTime = millis();
+
+    // Filter definieren, um Speicher zu sparen
+    static JsonDocument filter;
+    if (filter.size() == 0) {
+        filter["print"]["command"] = true;
+        filter["print"]["sequence_id"] = true;
+        filter["print"]["upgrade_state"] = true;
+        filter["print"]["ams"]["ams"][0]["id"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["id"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tray_info_idx"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tray_type"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tray_sub_brands"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tray_color"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["nozzle_temp_min"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["nozzle_temp_max"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["setting_id"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["cali_idx"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["remain"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tray_uuid"] = true;
+        filter["print"]["ams"]["ams"][0]["tray"][0]["tag_uid"] = true;
+        
+        filter["print"]["vt_tray"]["tray_info_idx"] = true;
+        filter["print"]["vt_tray"]["tray_type"] = true;
+        filter["print"]["vt_tray"]["tray_sub_brands"] = true;
+        filter["print"]["vt_tray"]["tray_color"] = true;
+        filter["print"]["vt_tray"]["nozzle_temp_min"] = true;
+        filter["print"]["vt_tray"]["nozzle_temp_max"] = true;
+        filter["print"]["vt_tray"]["setting_id"] = true;
+        filter["print"]["vt_tray"]["cali_idx"] = true;
+        filter["print"]["vt_tray"]["remain"] = true;
+        filter["print"]["vt_tray"]["tray_uuid"] = true;
+        filter["print"]["vt_tray"]["tag_uid"] = true;
+
+        filter["print"]["ams_id"] = true;
+        filter["print"]["tray_id"] = true;
+        filter["print"]["setting_id"] = true;
     }
 
     // JSON-Dokument parsen
     JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, message);
-    message = "";
+    DeserializationError error = deserializeJson(doc, payload, length, DeserializationOption::Filter(filter));
+    // DeserializationError error = deserializeJson(doc, payload, length);
+    
     if (error) 
     {
         Serial.print("Fehler beim Parsen des JSON: ");
@@ -447,8 +710,22 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
+    serializeJson(doc, Serial);
+    Serial.println();
+
+    if (doc.containsKey("print")) {
+        Serial.println("JSON contains 'print' key");
+        if (doc["print"].containsKey("ams")) {
+             Serial.println("JSON contains 'ams' key");
+        } else {
+             Serial.println("JSON missing 'ams' key");
+        }
+    } else {
+        Serial.println("JSON missing 'print' key");
+    }
+
     // Prüfen, ob "print->upgrade_state" und "print.ams.ams" existieren
-    if (doc["print"]["upgrade_state"].is<JsonObject>() || (doc["print"]["command"].is<String>() && doc["print"]["command"] == "push_status")) 
+    if (doc["print"]["upgrade_state"].is<JsonObject>() || (doc["print"]["command"].is<String>() && doc["print"]["command"] == "push_status") || doc["print"]["ams"].is<JsonObject>()) 
     {
         // Prüfen ob AMS-Daten vorhanden sind
         if (!doc["print"]["ams"].is<JsonObject>() || !doc["print"]["ams"]["ams"].is<JsonArray>()) 
@@ -485,13 +762,35 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             for (int j = 0; j < trayArray.size() && j < 4 && !hasChanges; j++) {
                 JsonObject trayObj = trayArray[j];
 
-                if (trayObj["tray_type"].as<String>() == "") ams_data[storedIndex].trays[j].setting_id = "";
                 if (trayObj["setting_id"].isNull()) trayObj["setting_id"] = "";
+                
+                // Check if tray was empty and is now filled (for pending tray assignment)
+                String oldTrayType = ams_data[storedIndex].trays[j].tray_type;
+                String newTrayType = trayObj["tray_type"].as<String>();
+                bool wasEmpty = (oldTrayType == "" || oldTrayType.length() == 0);
+                bool isNowFilled = (newTrayType != "" && newTrayType.length() > 0);
+                
+                if (wasEmpty && isNowFilled && hasPendingTrayAssignment()) {
+                    // Check if this is a Bambu spool (has valid tag_uid or tray_uuid)
+                    String newTagUid = trayObj["tag_uid"].as<String>();
+                    String newTrayUuid = trayObj["tray_uuid"].as<String>();
+                    bool isBambuSpool = (newTagUid != "" && newTagUid != "0000000000000000") ||
+                                        (newTrayUuid != "" && newTrayUuid != "00000000000000000000000000000000");
+                    
+                    Serial.printf("Tray filled detected: AMS %d Tray %d, type=%s, isBambu=%d\n", 
+                        amsId, trayObj["id"].as<uint8_t>(), newTrayType.c_str(), isBambuSpool);
+                    
+                    checkTrayFilled(amsId, trayObj["id"].as<uint8_t>(), isBambuSpool);
+                }
+                
                 if (trayObj["tray_info_idx"].as<String>() != ams_data[storedIndex].trays[j].tray_info_idx ||
                     trayObj["tray_type"].as<String>() != ams_data[storedIndex].trays[j].tray_type ||
                     trayObj["tray_color"].as<String>() != ams_data[storedIndex].trays[j].tray_color ||
-                    (trayObj["setting_id"].as<String>() != "" && trayObj["setting_id"].as<String>() != ams_data[storedIndex].trays[j].setting_id) ||
-                    trayObj["cali_idx"].as<String>() != ams_data[storedIndex].trays[j].cali_idx) {
+                    trayObj["setting_id"].as<String>() != ams_data[storedIndex].trays[j].setting_id ||
+                    trayObj["cali_idx"].as<String>() != ams_data[storedIndex].trays[j].cali_idx ||
+                    trayObj["remain"].as<int>() != ams_data[storedIndex].trays[j].remain ||
+                    trayObj["tray_uuid"].as<String>() != ams_data[storedIndex].trays[j].tray_uuid ||
+                    trayObj["tag_uid"].as<String>() != ams_data[storedIndex].trays[j].tag_uid) {
                     hasChanges = true;
 
                     if (bambuCredentials.autosend_enable && autoSetToBambuSpoolId > 0 && hasChanges)
@@ -509,13 +808,15 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         if (doc["print"]["vt_tray"].is<JsonObject>()) {
             for (int i = 0; i < ams_count; i++) {
                 if (ams_data[i].ams_id == 255) {
-                    if (vtTray["tray_type"].as<String>() == "") ams_data[i].trays[0].setting_id = "";
                     if (vtTray["setting_id"].isNull()) vtTray["setting_id"] = "";
                     if (vtTray["tray_info_idx"].as<String>() != ams_data[i].trays[0].tray_info_idx ||
                         vtTray["tray_type"].as<String>() != ams_data[i].trays[0].tray_type ||
                         vtTray["tray_color"].as<String>() != ams_data[i].trays[0].tray_color ||
-                        (vtTray["setting_id"].as<String>() != "" && vtTray["setting_id"].as<String>() != ams_data[i].trays[0].setting_id) ||
-                        (vtTray["tray_type"].as<String>() != "" && vtTray["cali_idx"].as<String>() != ams_data[i].trays[0].cali_idx)) {
+                        vtTray["setting_id"].as<String>() != ams_data[i].trays[0].setting_id ||
+                        (vtTray["tray_type"].as<String>() != "" && vtTray["cali_idx"].as<String>() != ams_data[i].trays[0].cali_idx) ||
+                        vtTray["remain"].as<int>() != ams_data[i].trays[0].remain ||
+                        vtTray["tray_uuid"].as<String>() != ams_data[i].trays[0].tray_uuid ||
+                        vtTray["tag_uid"].as<String>() != ams_data[i].trays[0].tag_uid) {
                         hasChanges = true;
 
                         if (bambuCredentials.autosend_enable && autoSetToBambuSpoolId > 0 && hasChanges)
@@ -566,58 +867,238 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     }
 }
 
-void reconnect() {
-    // Loop until we're reconnected
-    uint8_t retries = 0;
+// Returns true if connected, false if should stop trying
+// Track consecutive restart failures for backoff
+static unsigned long lastRestartAttempt = 0;
+static uint8_t consecutiveRestartFailures = 0;
+
+bool reconnect() {
+    // Non-blocking reconnect with exponential backoff + jitter and richer logging
+    uint8_t attempt = 0;
+
+    // Make local copies of credentials to avoid String invalidation during reconnect
+    String localSerial = bambuCredentials.serial;
+    String localAccesscode = bambuCredentials.accesscode;
+    String localIp = bambuCredentials.ip;
+
+    if (localSerial.isEmpty() || localAccesscode.isEmpty() || localIp.isEmpty()) {
+        Serial.println("Bambu credentials not set, cannot reconnect");
+        bambu_connected = false;
+        return false;
+    }
+
+    IPAddress serverIp;
+    if (!serverIp.fromString(localIp)) {
+        Serial.println("Invalid Bambu IP address in reconnect");
+        bambu_connected = false;
+        return false;
+    }
+
+    // Full cleanup of SSL/TCP stack before reconnecting
+    Serial.printf("Reconnect cleanup: Stopping MQTT client (heap: %u)\n", ESP.getFreeHeap());
+    if (client.connected()) client.disconnect();
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    // Cleanup sockets via the MQTT adapter (async client manages TLS)
+    Serial.println("Reconnect cleanup: disconnecting MQTT client and letting adapter reset sockets");
+    if (client.connected()) client.disconnect();
+    vTaskDelay(300 / portTICK_PERIOD_MS);
+
+    Serial.printf("Reconnect cleanup: Complete (heap: %u)\n", ESP.getFreeHeap());
+
+    client.setServer(serverIp, 8883);
+    client.setSocketTimeout(15);  // 15 second socket timeout
+    
+    // CRITICAL: Set callback before attempting connection
+    client.setCallback(mqtt_callback);
+
+    // Try to connect with exponential backoff and jitter
     while (!client.connected()) {
-        Serial.println("Attempting MQTT re/connection...");
+        attempt++;
+
+        // Respect WiFi
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected during MQTT reconnect, waiting...");
+            // wait in small intervals and pet WDT
+            for (int i = 0; i < 25 && WiFi.status() != WL_CONNECTED; ++i) {
+                esp_task_wdt_reset();
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+            }
+            continue;
+        }
+
+        // Check heap
+        if (ESP.getFreeHeap() < 30000) {
+            Serial.printf("Low heap (%u) - waiting before reconnect\n", ESP.getFreeHeap());
+            // wait and reset WDT periodically
+            for (int i = 0; i < 20 && ESP.getFreeHeap() < 30000; ++i) {
+                esp_task_wdt_reset();
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+            }
+            continue;
+        }
+
+        String clientId = localSerial + "_" + String(random(0, 1000));
+        Serial.printf("Attempting MQTT connection (attempt %u) clientId=%s\n", attempt, clientId.c_str());
         bambu_connected = false;
         oledShowTopRow();
 
-        // Attempt to connect
-        String clientId = bambuCredentials.serial + "_" + String(random(0, 100));
-        if (client.connect(clientId.c_str(), BAMBU_USERNAME, bambuCredentials.accesscode.c_str())) {
-            Serial.println("MQTT re/connected");
-
-            client.subscribe(("device/"+bambuCredentials.serial+"/report").c_str());
+        if (client.connect(clientId.c_str(), BAMBU_USERNAME, localAccesscode.c_str())) {
+            Serial.printf("MQTT connected on attempt %u\n", attempt);
+            String reportTopic = "device/" + localSerial + "/report";
+            String requestTopic = "device/" + localSerial + "/request";
+            client.subscribe(reportTopic.c_str());
+            client.subscribe(requestTopic.c_str());
             bambu_connected = true;
+            consecutiveRestartFailures = 0;
             oledShowTopRow();
-        } else {
-            Serial.print("failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" try again in 5 seconds");
-            bambu_connected = false;
-            oledShowTopRow();
-            
-            yield();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            if (retries > 5) {
-                Serial.println("Disable Bambu MQTT Task after 5 retries");
-                //vTaskSuspend(BambuMqttTask);
-                vTaskDelete(BambuMqttTask);
-                BambuMqttTask = NULL;
-                break;
-            }
+            return true;
+        }
 
-            retries++;
+        int st = client.state();
+        Serial.printf("MQTT connect failed (state=%d:%s)\n", st, mqttStateToString(st));
+        bambu_connected = false;
+        oledShowTopRow();
+
+        // After several attempts escalate failure count and give up
+        if (attempt >= 8) {
+            Serial.println("Disable Bambu MQTT Task after repeated failures");
+            consecutiveRestartFailures++;
+            return false;
+        }
+
+        // Wait using exponential backoff with jitter
+        unsigned long waitMs = backoffDelayMs(attempt, 3000, 300000);
+        Serial.printf("Waiting %lu ms before next MQTT reconnect attempt\n", waitMs);
+        unsigned long start = millis();
+        while (millis() - start < waitMs) {
+            // keep system responsive and pet WDT
+            if (WiFi.status() != WL_CONNECTED) break;
+            esp_task_wdt_reset();
+            vTaskDelay(200 / portTICK_PERIOD_MS);
         }
     }
+    return true;
 }
 
+// Poll interval in milliseconds (60 seconds between polls)
+#define MQTT_POLL_INTERVAL 60000
+// How long to stay connected waiting for data (30 seconds max - Bambu can be slow)
+#define MQTT_CONNECT_TIMEOUT 30000
+
 void mqtt_loop(void * parameter) {
-    Serial.println("Bambu MQTT Task gestartet");
+    Serial.println("Bambu MQTT Task gestartet (Poll Mode)");
+    static unsigned long lastPollTime = 0;
+    static unsigned long connectStartTime = 0;
+    static bool waitingForData = false;
+    static bool dataReceived = false;
+    
+    // If we're already connected (from setupMqtt), initialize the waiting state
+    if (client.connected()) {
+        connectStartTime = millis();
+        waitingForData = true;
+        dataReceived = false;
+        Serial.println("MQTT Poll: Already connected from setup, waiting for data...");
+    }
+    
     for(;;) {
-        if (pauseBambuMqttTask) {
-            vTaskDelay(10000);
+            if (pauseBambuMqttTask) {
+                // If paused, disconnect to save resources
+                if (client.connected()) {
+                    Serial.println("MQTT: Pausing - disconnecting");
+                    client.disconnect();
+                }
+                // Break long sleep into smaller chunks and pet the task WDT
+                for (int i = 0; i < 20 && pauseBambuMqttTask; ++i) {
+                    esp_task_wdt_reset();
+                    vTaskDelay(500 / portTICK_PERIOD_MS);
+                }
+                continue;
+            }
+
+        unsigned long now = millis();
+        
+        // Check if it's time to poll (or if we need initial data)
+        bool shouldPoll = (ams_count == 0) || (now - lastPollTime >= MQTT_POLL_INTERVAL);
+        
+        if (!client.connected()) {
+            // If we're not connected and should poll, connect
+            if (shouldPoll) {
+                Serial.printf("MQTT Poll: Connecting (heap: %u)...\n", ESP.getFreeHeap());
+                
+                bool shouldContinue = reconnect();
+                if (!shouldContinue) {
+                    Serial.println("Exiting MQTT task after failed reconnection attempts");
+                    BambuMqttTask = NULL;
+                    vTaskDelete(NULL);
+                    return;
+                }
+                
+                if (client.connected()) {
+                    // Request data
+                    JsonDocument doc;
+                    doc["pushing"]["sequence_id"] = "0";
+                    doc["pushing"]["command"] = "pushall";
+                    doc["pushing"]["version"] = 1;
+                    String output;
+                    serializeJson(doc, output);
+                    sendMqttMessage(output);
+                    
+                    connectStartTime = now;
+                    waitingForData = true;
+                    dataReceived = false;
+                    Serial.println("MQTT Poll: Connected, waiting for data...");
+                }
+            } else {
+                // Not time to poll yet, just wait
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                continue;
+            }
+        }
+        
+        // We're connected, process messages
+        if (client.connected()) {
+            client.loop();
+            
+            // Check if we got AMS data (ams_count > 0 means we have data)
+            if (waitingForData && ams_count > 0) {
+                Serial.printf("MQTT Poll: Received AMS data (ams_count=%d), will disconnect\n", ams_count);
+                dataReceived = true;
+            }
+            
+            // Disconnect after receiving data OR timeout
+            bool shouldDisconnect = false;
+            
+            if (dataReceived) {
+                Serial.println("MQTT Poll: Data received, disconnecting to save resources");
+                shouldDisconnect = true;
+            } else if (now - connectStartTime > MQTT_CONNECT_TIMEOUT) {
+                Serial.printf("MQTT Poll: Timeout waiting for data (ams_count=%d), disconnecting\n", ams_count);
+                shouldDisconnect = true;
+            }
+            
+            if (shouldDisconnect) {
+                // Full cleanup to ensure clean reconnect
+                Serial.printf("MQTT Poll: Disconnecting (state=%d:%s)\n", client.state(), mqttStateToString(client.state()));
+                client.disconnect();
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                // Let the adapter manage TLS/socket cleanup; small pause to let resources free
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                
+                waitingForData = false;
+                lastPollTime = now;
+                bambu_connected = false;
+                oledShowTopRow();
+                
+                Serial.printf("MQTT Poll: Disconnected. Next poll in %d seconds. Free heap: %u\n", 
+                    MQTT_POLL_INTERVAL / 1000, ESP.getFreeHeap());
+                
+                // Wait a bit before next iteration
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                continue;
+            }
         }
 
-        if (!client.connected()) {
-            reconnect();
-            yield();
-            esp_task_wdt_reset();
-            vTaskDelay(100);
-        }
-        client.loop();
         yield();
         esp_task_wdt_reset();
         vTaskDelay(100);
@@ -630,21 +1111,85 @@ bool setupMqtt() {
 
     if (bambuCredentials.ip != "" && bambuCredentials.accesscode != "" && bambuCredentials.serial != "") 
     {
+        if (amsDataMutex == NULL) {
+            amsDataMutex = xSemaphoreCreateMutex();
+        }
+
         oledShowProgressBar(4, 7, DISPLAY_BOOT_TEXT, "Bambu init");
         bambuDisabled = false;
-        sslClient.setCACert(root_ca);
-        sslClient.setInsecure();
-        client.setServer(bambuCredentials.ip.c_str(), 8883);
+        
+        // Ensure any existing connection is cleanly disconnected
+        if (client.connected()) client.disconnect();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        Serial.println("Using async MQTT adapter; TLS managed by adapter (verify certs if issues persist)");
+        
+        // Make local copies to ensure stability during connection
+        String localIp = bambuCredentials.ip;
+        String localSerial = bambuCredentials.serial;
+        String localAccesscode = bambuCredentials.accesscode;
+        
+        // Convert IP to IPAddress for safer usage
+        IPAddress serverIp;
+        if (!serverIp.fromString(localIp)) {
+            Serial.println("Invalid Bambu IP address");
+            bambuDisabled = true;
+            return false;
+        }
+        
+        client.setServer(serverIp, 8883);
+        client.setSocketTimeout(15);
+        // Set conservative socket timeout on adapter
+        client.setSocketTimeout(15);
+        // Mirror previous behavior: disable cert validation (OpenSpool-style insecure TLS)
+        client.setInsecure();
+        
+        // CRITICAL: Set callback BEFORE connecting so messages are handled immediately
+        client.setCallback(mqtt_callback);
 
         // Verbinden mit dem MQTT-Server
         bool connected = true;
-        String clientId = String(bambuCredentials.serial) + "_" + String(random(0, 100));
-        if (client.connect(bambuCredentials.ip.c_str(), BAMBU_USERNAME, bambuCredentials.accesscode.c_str())) 
+        String clientId = localSerial + "_" + String(random(0, 100));
+        if (client.connect(clientId.c_str(), BAMBU_USERNAME, localAccesscode.c_str()))
         {
-            client.setCallback(mqtt_callback);
-            client.setBufferSize(15488);
-            client.subscribe(("device/"+bambuCredentials.serial+"/report").c_str());
+            // Try 48KB
+            if (!client.setBufferSize(49152)) {
+                Serial.println("Bambu: Failed to allocate 48KB MQTT buffer!");
+                // Try 32KB (32768)
+                if (!client.setBufferSize(32768)) {
+                    Serial.println("Bambu: Failed to allocate 32KB MQTT buffer!");
+                    // Try 25KB
+                    if (!client.setBufferSize(25600)) {
+                        Serial.println("Bambu: Failed to allocate 25KB MQTT buffer!");
+                        // Fallback to 20KB
+                        if (!client.setBufferSize(20480)) {
+                            Serial.println("Bambu: Failed to allocate 20KB MQTT buffer!");
+                        } else {
+                            Serial.println("Bambu: 20KB MQTT buffer allocated.");
+                        }
+                    } else {
+                        Serial.println("Bambu: 25KB MQTT buffer allocated.");
+                    }
+                } else {
+                    Serial.println("Bambu: 32KB MQTT buffer allocated.");
+                }
+            } else {
+                Serial.println("Bambu: 48KB MQTT buffer allocated.");
+            }
+            
+            String reportTopic = "device/" + localSerial + "/report";
+            String requestTopic = "device/" + localSerial + "/request";
+            client.subscribe(reportTopic.c_str());
+            client.subscribe(requestTopic.c_str());
             Serial.println("MQTT-Client initialisiert");
+
+            // Request full data
+            JsonDocument doc;
+            doc["pushing"]["sequence_id"] = "0";
+            doc["pushing"]["command"] = "pushall";
+            doc["pushing"]["version"] = 1;
+            String output;
+            serializeJson(doc, output);
+            sendMqttMessage(output);
 
             oledShowMessage("Bambu Connected");
             bambu_connected = true;
@@ -661,7 +1206,8 @@ bool setupMqtt() {
         } 
         else 
         {
-            Serial.println("Fehler: Konnte sich nicht beim MQTT-Server anmelden");
+            int st = client.state();
+            Serial.printf("Error: Could not connect to MQTT server (rc=%d:%s)\n", st, mqttStateToString(st));
             oledShowMessage("Bambu Connection Failed");
             vTaskDelay(2000 / portTICK_PERIOD_MS);
             connected = false;
@@ -682,10 +1228,49 @@ bool setupMqtt() {
 void bambu_restart() {
     Serial.println("Bambu restart");
 
+    // Check for backoff - if we've failed multiple times, wait longer
+    unsigned long now = millis();
+    unsigned long backoffTime = 0;
+    
+    if (consecutiveRestartFailures > 0) {
+        // Exponential backoff: 30s, 60s, 120s, max 5min
+        backoffTime = min((unsigned long)(30000 * (1 << (consecutiveRestartFailures - 1))), (unsigned long)300000);
+        
+        if (now - lastRestartAttempt < backoffTime) {
+            Serial.printf("Bambu restart backoff: waiting %lu more seconds (failures: %d)\n", 
+                (backoffTime - (now - lastRestartAttempt)) / 1000, consecutiveRestartFailures);
+            return;
+        }
+    }
+    
+    lastRestartAttempt = now;
+
+    // First disconnect MQTT client cleanly
+    if (client.connected()) {
+        client.disconnect();
+    }
+    
+    // Underlying TLS/sockets are cleaned up by the adapter on disconnect
+
     if (BambuMqttTask) {
         vTaskDelete(BambuMqttTask);
         BambuMqttTask = NULL;
-        delay(10);
+        vTaskDelay(100 / portTICK_PERIOD_MS);  // Give time for task cleanup
     }
-    setupMqtt();
+    
+    // Reset connection state
+    bambu_connected = false;
+    
+    // Longer delay to ensure clean state and let resources free
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    
+    // Force garbage collection by yielding
+    yield();
+    
+    Serial.printf("Bambu restart: Free heap before setupMqtt: %u\n", ESP.getFreeHeap());
+    
+    if (!setupMqtt()) {
+        Serial.println("Bambu restart: setupMqtt failed");
+        consecutiveRestartFailures++;
+    }
 }

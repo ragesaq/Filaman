@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 
 #include "wlan.h"
 #include "config.h"
@@ -10,6 +11,7 @@
 #include "bambu.h"
 #include "nfc.h"
 #include "scale.h"
+#include "led.h"
 #include "esp_task_wdt.h"
 #include "commonFS.h"
 
@@ -32,10 +34,42 @@ void setup() {
   initializeFileSystem();
 
   // Start Display
-  setupDisplay();
+  // setupDisplay();
+  
+  // Setup LED
+  setupLed();
+  setLedDefaultPattern(LED_PATTERN_INITIALIZING);
 
   // WiFiManager
   initWiFi();
+  
+  // ArduinoOTA setup
+  ArduinoOTA.setHostname("filaman");
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_SPIFFS
+      type = "filesystem";
+    }
+    Serial.println("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("ArduinoOTA ready");
 
   // Webserver
   setupWebserver(server);
@@ -48,18 +82,20 @@ void setup() {
 
   // NFC Reader
   startNfc();
+  setLedDefaultPattern(LED_PATTERN_SEARCHING);
 
   // Touch Sensor
-  pinMode(TTP223_PIN, INPUT_PULLUP);
-  if (digitalRead(TTP223_PIN) == LOW) 
-  {
-    Serial.println("Touch Sensor is connected");
-    touchSensorConnected = true;
-  }
+  // pinMode(TTP223_PIN, INPUT_PULLUP);
+  // if (digitalRead(TTP223_PIN) == LOW) 
+  // {
+  //   Serial.println("Touch Sensor is connected");
+  //   touchSensorConnected = true;
+  // }
 
-  // Scale
-  start_scale(touchSensorConnected);
-  scaleTareRequest = true;
+  // Scale - DISABLED
+  // start_scale(touchSensorConnected);
+  // scaleTareRequest = true;
+  Serial.println("Scale functionality disabled");
 
   // WDT initialisieren mit 10 Sekunden Timeout
   bool panic = true; // Wenn true, löst ein WDT-Timeout einen System-Panik aus
@@ -109,12 +145,15 @@ const unsigned long debounceDelay = 500; // 500 ms debounce delay
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Überprüfe den Status des Touch Sensors
-  if (touchSensorConnected && digitalRead(TTP223_PIN) == HIGH && currentMillis - lastButtonPress > debounceDelay) 
-  {
-    lastButtonPress = currentMillis;
-    scaleTareRequest = true;
-  }
+  // Handle OTA updates
+  ArduinoOTA.handle();
+
+  // Touch Sensor - DISABLED
+  // if (touchSensorConnected && digitalRead(TTP223_PIN) == HIGH && currentMillis - lastButtonPress > debounceDelay) 
+  // {
+  //   lastButtonPress = currentMillis;
+  //   scaleTareRequest = true;
+  // }
 
   // Überprüfe regelmäßig die WLAN-Verbindung
   if (intervalElapsed(currentMillis, lastWifiCheckTime, WIFI_CHECK_INTERVAL)) 
@@ -131,12 +170,31 @@ void loop() {
   // Periodic spoolman health check
   if (intervalElapsed(currentMillis, lastSpoolmanHealcheckTime, SPOOLMAN_HEALTHCHECK_INTERVAL)) 
   {
-    checkSpoolmanInstance();
+    // Only check Spoolman if we are not desperately trying to connect to Bambu
+    if (bambuDisabled || bambu_connected) {
+      checkSpoolmanInstance();
+    } else {
+      Serial.println("Skipping Spoolman check while Bambu is reconnecting");
+    }
+  }
+
+  // Periodic Bambu health check - Restart task if it died (e.g. due to WiFi loss)
+  static unsigned long lastBambuCheckTime = 0;
+  if (intervalElapsed(currentMillis, lastBambuCheckTime, 30000)) 
+  {
+    if (!bambuDisabled && BambuMqttTask == NULL) 
+    {
+      Serial.println("Bambu MQTT Task died, attempting restart...");
+      bambu_restart();
+    }
   }
 
   // Wenn Bambu auto set Spool aktiv
   if (bambuCredentials.autosend_enable && autoSetToBambuSpoolId > 0 && !nfcWriteInProgress) 
   {
+    if (getLedDefaultPattern() != LED_PATTERN_AMS_QUEUED) {
+      setLedDefaultPattern(LED_PATTERN_AMS_QUEUED);
+    }
     if (!bambuDisabled && !bambu_connected) 
     {
       bambu_restart();
@@ -157,6 +215,7 @@ void loop() {
           if (!nfcWriteInProgress) {
             oledShowWeight(weight);
           }
+          setLedDefaultPattern(LED_PATTERN_SEARCHING);
         }
       }
       else
@@ -164,6 +223,15 @@ void loop() {
         autoAmsCounter = 0;
       }
     }
+  }
+  else if (!nfcWriteInProgress && autoSetToBambuSpoolId == 0 && getLedDefaultPattern() == LED_PATTERN_AMS_QUEUED)
+  {
+    setLedDefaultPattern(LED_PATTERN_SEARCHING);
+  }
+
+  // Check for pending tray assignment timeout
+  if (hasPendingTrayAssignment()) {
+    checkPendingTrayAssignment();
   }
 
   // If scale is not calibrated, only show a warning

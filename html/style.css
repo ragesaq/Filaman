@@ -1205,3 +1205,44 @@ input[type="submit"]:disabled,
     border-radius: 4px;
     margin-bottom: 20px;
 }
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .navbar {
+        flex-direction: column;
+        height: auto;
+        padding: 1rem;
+        gap: 1rem;
+        width: calc(100% - 2rem);
+    }
+
+    .navbar > div:first-child {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .navbar nav {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 0.5rem;
+    }
+
+    .status-container {
+        width: 100%;
+        justify-content: center;
+        margin-top: 0.5rem;
+    }
+
+    .content {
+        margin-top: 14rem; /* Mehr Platz für den höheren Header */
+        padding: 1rem;
+    }
+
+    .logo-text h1 {
+        font-size: 1.5rem;
+    }
+    
+    .logo-text h4 {
+        font-size: 0.9rem;
+    }
+}

@@ -2,12 +2,9 @@
 #define DISPLAY_H
 
 #include <Arduino.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include "config.h"
 
-
-extern Adafruit_SSD1306 display;
+// extern Adafruit_SSD1306 display;
 extern bool wifiOn;
 
 void setupDisplay();

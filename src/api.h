@@ -28,6 +28,7 @@ typedef enum {
 extern volatile spoolmanApiStateType spoolmanApiState;
 extern bool spoolman_connected;
 extern String spoolmanUrl;
+extern String spoolmanInternalUrl;
 extern bool octoEnabled;
 extern bool sendOctoUpdate;
 extern String octoUrl;

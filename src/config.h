@@ -7,6 +7,7 @@
 
 #define NVS_NAMESPACE_API                   "api"
 #define NVS_KEY_SPOOLMAN_URL                "spoolmanUrl"
+#define NVS_KEY_SPOOLMAN_INTERNAL_URL       "spoolmanIntUrl"
 #define NVS_KEY_OCTOPRINT_ENABLED           "octoEnabled"
 #define NVS_KEY_OCTOPRINT_URL               "octoUrl"
 #define NVS_KEY_OCTOPRINT_TOKEN             "octoToken"
@@ -40,12 +41,19 @@
 extern const uint8_t PN532_IRQ;
 extern const uint8_t PN532_RESET;
 
+#ifdef USE_RC522
+extern const uint8_t RC522_SS_PIN;
+extern const uint8_t RC522_RST_PIN;
+#endif
+
 extern const uint8_t LOADCELL_DOUT_PIN;
 extern const uint8_t LOADCELL_SCK_PIN;
 extern const uint8_t calVal_eepromAdress;
 extern const uint16_t SCALE_LEVEL_WEIGHT;
 
-extern const uint8_t TTP223_PIN;
+#define TTP223_PIN 25
+#define LED_PIN 26
+#define LED_COUNT 1
 
 extern const uint8_t OLED_TOP_START;
 extern const uint8_t OLED_TOP_END;

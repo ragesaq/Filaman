@@ -11,6 +11,7 @@ volatile spoolmanApiStateType spoolmanApiState = API_IDLE;
 
 //bool spoolman_connected = false;
 String spoolmanUrl = "";
+String spoolmanInternalUrl = "";
 bool octoEnabled = false;
 bool sendOctoUpdate = false;
 String octoUrl = "";
@@ -26,6 +27,27 @@ bool spoolmanConnected = false;
 bool spoolmanExtraFieldsChecked = false;
 TaskHandle_t* apiTask;
 
+// Generate a tag ID from the NFC UID: hex characters from UID + random 8 alphanumeric chars
+String generateTagId(const String& uidString) {
+    // Strip non-alphanumeric characters from UID
+    String cleanUid = "";
+    for (size_t i = 0; i < uidString.length(); i++) {
+        char c = uidString.charAt(i);
+        if (isalnum(c)) {
+            cleanUid += c;
+        }
+    }
+    
+    // Generate 8 random alphanumeric characters
+    const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    String randomPart = "";
+    for (int i = 0; i < 8; i++) {
+        randomPart += alphanum[random(0, sizeof(alphanum) - 1)];
+    }
+    
+    return cleanUid + randomPart;
+}
+
 struct SendToApiParams {
     SpoolmanApiRequestType requestType;
     String httpType;
@@ -40,7 +62,10 @@ struct SendToApiParams {
 
 JsonDocument fetchSingleSpoolInfo(int spoolId) {
     HTTPClient http;
-    String spoolsUrl = spoolmanUrl + apiUrl + "/spool/" + spoolId;
+    http.setReuse(false);
+    http.setTimeout(10000);
+    String targetUrl = (spoolmanInternalUrl != "") ? spoolmanInternalUrl : spoolmanUrl;
+    String spoolsUrl = targetUrl + apiUrl + "/spool/" + spoolId;
 
     Serial.print("Rufe Spool-Daten von: ");
     Serial.println(spoolsUrl);
@@ -430,9 +455,14 @@ bool updateSpoolTagId(String uidString, const char* payload) {
     
     doc.clear();
 
-    // Update Payload erstellen
+    // Generate tag ID: UID hex + random 8 alphanumeric chars
+    String tagId = generateTagId(uidString);
+    Serial.print("Generated tag ID: ");
+    Serial.println(tagId);
+
+    // Update Payload erstellen - use "tag" field instead of "nfc_id"
     JsonDocument updateDoc;
-    updateDoc["extra"]["nfc_id"] = "\""+uidString+"\"";
+    updateDoc["extra"]["tag"] = "\"" + tagId + "\"";
     
     String updatePayload;
     serializeJson(updateDoc, updatePayload);
@@ -619,41 +649,12 @@ bool updateSpoolBambuData(String payload) {
     Serial.print("Update Spule mit URL: ");
     Serial.println(spoolsUrl);
 
-    JsonDocument updateDoc;
-    updateDoc["extra"]["bambu_setting_id"] = "\"" + doc["setting_id"].as<String>() + "\"";
-    updateDoc["extra"]["bambu_cali_id"] = "\"" + doc["cali_idx"].as<String>() + "\"";
-    updateDoc["extra"]["bambu_idx"] = "\"" + doc["tray_info_idx"].as<String>() + "\"";
-    updateDoc["extra"]["nozzle_temperature"] = "[" + doc["temp_min"].as<String>() + "," + doc["temp_max"].as<String>() + "]";
-
-    String updatePayload;
-    serializeJson(updateDoc, updatePayload);
-
+    // Note: Previously updated bambu_setting_id, bambu_cali_id, bambu_idx, nozzle_temperature
+    // These fields are no longer used - only the "tag" field is stored in Spoolman extras
+    
+    // Nothing to update since we're not storing bambu-specific extra fields anymore
+    Serial.println("updateSpoolBambuData: No extra fields to update (deprecated)");
     doc.clear();
-    updateDoc.clear();
-
-    Serial.print("Update Payload: ");
-    Serial.println(updatePayload);
-
-    SendToApiParams* params = new SendToApiParams();
-    if (params == nullptr) {
-        Serial.println("Fehler: Kann Speicher für Task-Parameter nicht allokieren.");
-        return false;
-    }
-    params->requestType = API_REQUEST_BAMBU_UPDATE;
-    params->httpType = "PATCH";
-    params->spoolsUrl = spoolsUrl;
-    params->updatePayload = updatePayload;
-
-    // Erstelle die Task
-    BaseType_t result = xTaskCreate(
-        sendToApi,                // Task-Funktion
-        "SendToApiTask",          // Task-Name
-        6144,                     // Stackgröße in Bytes
-        (void*)params,            // Parameter
-        0,                        // Priorität
-        apiTask                      // Task-Handle (nicht benötigt)
-    );
-
     return true;
 }
 
@@ -959,6 +960,11 @@ uint16_t createSpool(uint16_t vendorId, uint16_t filamentId, JsonDocument& paylo
     Serial.print("Create spool with URL: ");
     Serial.println(spoolsUrl);
 
+    // Generate tag ID: UID hex + random 8 alphanumeric chars
+    String tagId = generateTagId(uidString);
+    Serial.print("Generated tag ID for new spool: ");
+    Serial.println(tagId);
+
     // Create JSON payload for spool creation
     JsonDocument spoolDoc;
     spoolDoc["filament_id"] = String(filamentId);
@@ -967,7 +973,7 @@ uint16_t createSpool(uint16_t vendorId, uint16_t filamentId, JsonDocument& paylo
     spoolDoc["remaining_weight"] = spoolDoc["initial_weight"];
     spoolDoc["lot_nr"] = (payload["an"].is<String>() && payload["an"].as<String>().length() > 0) ? payload["an"].as<String>() : "";
     spoolDoc["comment"] = "automatically generated";
-    spoolDoc["extra"]["nfc_id"] = "\"" + uidString + "\"";
+    spoolDoc["extra"]["tag"] = "\"" + tagId + "\"";
 
     String spoolPayload;
     serializeJson(spoolDoc, spoolPayload);
@@ -1070,30 +1076,26 @@ bool checkSpoolmanExtraFields() {
     // Only check extra fields if they have not been checked before
     if(!spoolmanExtraFieldsChecked){
         HTTPClient http;
+        http.setReuse(false);
+        http.setTimeout(10000);
         String checkUrls[] = {
             spoolmanUrl + apiUrl + "/field/spool",
             spoolmanUrl + apiUrl + "/field/filament"
         };
 
         String spoolExtra[] = {
-            "nfc_id"
+            "tag"
         };
 
         String filamentExtra[] = {
             "nozzle_temperature",
             "price_meter",
-            "price_gramm",
-            "bambu_setting_id",
-            "bambu_cali_id",
-            "bambu_idx",
-            "bambu_k",
-            "bambu_flow_ratio",
-            "bambu_max_volspeed"
+            "price_gramm"
         };
 
         String spoolExtraFields[] = {
-            "{\"name\": \"NFC ID\","
-            "\"key\": \"nfc_id\","
+            "{\"name\": \"Tag\","
+            "\"key\": \"tag\","
             "\"field_type\": \"text\"}"
         };
 
@@ -1112,33 +1114,7 @@ bool checkSpoolmanExtraFields() {
             "{\"name\": \"Price/g\","
             "\"unit\": \"€\","
             "\"field_type\": \"float\","
-            "\"key\": \"price_gramm\"}",
-
-            "{\"name\": \"Bambu Setting ID\","
-            "\"field_type\": \"text\","
-            "\"key\": \"bambu_setting_id\"}",
-
-            "{\"name\": \"Bambu Cali ID\","
-            "\"field_type\": \"text\","
-            "\"key\": \"bambu_cali_id\"}",
-
-            "{\"name\": \"Bambu Filament IDX\","
-            "\"field_type\": \"text\","
-            "\"key\": \"bambu_idx\"}",
-
-            "{\"name\": \"Bambu k\","
-            "\"field_type\": \"float\","
-            "\"key\": \"bambu_k\"}",
-
-            "{\"name\": \"Bambu Flow Ratio\","
-            "\"field_type\": \"float\","
-            "\"key\": \"bambu_flow_ratio\"}",
-
-            "{\"name\": \"Bambu Max Vol. Speed\","
-            "\"unit\": \"mm3/s\","
-            "\"field_type\": \"integer\","
-            "\"default_value\": \"12\","
-            "\"key\": \"bambu_max_volspeed\"}"
+            "\"key\": \"price_gramm\"}"
         };
 
         Serial.println("Überprüfe Extrafelder...");
@@ -1224,64 +1200,71 @@ bool checkSpoolmanExtraFields() {
 }
 
 bool checkSpoolmanInstance() {
-    HTTPClient http;
-    bool returnValue = false;
+    // Check heap before attempting SSL connection - HTTPS needs ~50-80KB
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 60000) {
+        Serial.printf("Skipping Spoolman check due to low heap: %u\n", freeHeap);
+        return spoolmanConnected;
+    }
 
     // Only do the spoolman instance check if there is no active API request going on
-    if(spoolmanApiState == API_IDLE){
-        spoolmanApiState = API_TRANSMITTING;
-        String healthUrl = spoolmanUrl + apiUrl + "/health";
+    if(spoolmanApiState != API_IDLE){
+        Serial.println("Skipping spoolman healthcheck, API is active.");
+        return spoolmanConnected;
+    }
 
-        Serial.print("Checking spoolman instance: ");
-        Serial.println(healthUrl);
+    spoolmanApiState = API_TRANSMITTING;
+    
+    HTTPClient http;
+    http.setReuse(false);
+    http.setTimeout(10000);
+    bool returnValue = false;
 
-        http.begin(healthUrl);
-        int httpCode = http.GET();
+    String targetUrl = (spoolmanInternalUrl != "") ? spoolmanInternalUrl : spoolmanUrl;
+    String healthUrl = targetUrl + apiUrl + "/health";
 
-        if (httpCode > 0) {
-            if (httpCode == HTTP_CODE_OK) {
-                String payload = http.getString();
-                JsonDocument doc;
-                DeserializationError error = deserializeJson(doc, payload);
-                if (!error && doc["status"].is<String>()) {
-                    const char* status = doc["status"];
-                    http.end();
+    Serial.printf("Checking spoolman instance: %s (heap: %u)\n", healthUrl.c_str(), freeHeap);
 
-                    if (!checkSpoolmanExtraFields()) {
-                        Serial.println("Fehler beim Überprüfen der Extrafelder.");
+    http.begin(healthUrl);
+    int httpCode = http.GET();
 
-                        // TBD
-                        oledShowMessage("Spoolman Error creating Extrafields");
-                        vTaskDelay(2000 / portTICK_PERIOD_MS);
-                        
-                        return false;
-                    }
+    if (httpCode > 0) {
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, payload);
+            if (!error && doc["status"].is<String>()) {
+                const char* status = doc["status"];
+                http.end();
 
+                if (!checkSpoolmanExtraFields()) {
+                    Serial.println("Fehler beim Überprüfen der Extrafelder.");
+                    oledShowMessage("Spoolman Error creating Extrafields");
+                    vTaskDelay(2000 / portTICK_PERIOD_MS);
                     spoolmanApiState = API_IDLE;
-                    oledShowTopRow();
-                    spoolmanConnected = true;
-                    returnValue = strcmp(status, "healthy") == 0;
-                }else{
-                    spoolmanConnected = false;
+                    return false;
                 }
 
-                doc.clear();
-            }else{
+                spoolmanApiState = API_IDLE;
+                oledShowTopRow();
+                spoolmanConnected = true;
+                returnValue = strcmp(status, "healthy") == 0;
+            } else {
                 spoolmanConnected = false;
+                http.end();
             }
+            doc.clear();
         } else {
             spoolmanConnected = false;
-            Serial.println("Error contacting spoolman instance! HTTP Code: " + String(httpCode));
+            http.end();
         }
+    } else {
+        spoolmanConnected = false;
+        Serial.println("Error contacting spoolman instance! HTTP Code: " + String(httpCode));
         http.end();
-        spoolmanApiState = API_IDLE;
     }
-    else
-    {
-        // If the check is skipped, return the previous status
-        Serial.println("Skipping spoolman healthcheck, API is active.");
-        returnValue = spoolmanConnected;
-    }
+    
+    spoolmanApiState = API_IDLE;
     Serial.println("Healthcheck completed!");
     return returnValue;
 }
@@ -1290,6 +1273,9 @@ bool saveSpoolmanUrl(const String& url, bool octoOn, const String& octo_url, con
     Preferences preferences;
     preferences.begin(NVS_NAMESPACE_API, false); // false = readwrite
     preferences.putString(NVS_KEY_SPOOLMAN_URL, url);
+    // If the URL is HTTPS, try to guess an internal HTTP URL or keep it empty
+    // For now, we don't auto-guess, but we could add a UI field later.
+    // However, we can read from a file if needed.
     preferences.putBool(NVS_KEY_OCTOPRINT_ENABLED, octoOn);
     preferences.putString(NVS_KEY_OCTOPRINT_URL, octo_url);
     preferences.putString(NVS_KEY_OCTOPRINT_TOKEN, octoTk);
@@ -1309,6 +1295,7 @@ String loadSpoolmanUrl() {
     Preferences preferences;
     preferences.begin(NVS_NAMESPACE_API, true);
     String spoolmanUrl = preferences.getString(NVS_KEY_SPOOLMAN_URL, "");
+    spoolmanInternalUrl = preferences.getString(NVS_KEY_SPOOLMAN_INTERNAL_URL, "");
     octoEnabled = preferences.getBool(NVS_KEY_OCTOPRINT_ENABLED, false);
     if(octoEnabled)
     {

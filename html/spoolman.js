@@ -31,7 +31,7 @@ function populateVendorDropdown(data, selectedSmId = null) {
     const allVendors = {};
     const filteredVendors = {};
 
-    vendorSelect.innerHTML = '<option value="">Bitte wählen...</option>';
+    vendorSelect.innerHTML = '<option value="">Please choose...</option>';
 
     let vendorIdToSelect = null;
     let totalSpools = 0;
@@ -64,12 +64,18 @@ function populateVendorDropdown(data, selectedSmId = null) {
 
         const vendor = spool.filament.vendor;
         
-        const hasValidNfcId = spool.extra && 
-                             spool.extra.nfc_id && 
-                             spool.extra.nfc_id !== '""' && 
-                             spool.extra.nfc_id !== '"\\"\\"\\""';
+        // Check for valid tag in extra.tag field (primary) or nfc_id (legacy)
+        const hasValidTag = spool.extra && (
+            (spool.extra.tag && 
+             spool.extra.tag !== '""' && 
+             spool.extra.tag !== '"\\"\\"\\""' &&
+             spool.extra.tag.replace(/"/g, '').length > 0) ||
+            (spool.extra.nfc_id && 
+             spool.extra.nfc_id !== '""' && 
+             spool.extra.nfc_id !== '"\\"\\"\\""')
+        );
         
-        if (!hasValidNfcId) {
+        if (!hasValidTag) {
             spoolsWithoutTag++;
         }
 
@@ -80,7 +86,7 @@ function populateVendorDropdown(data, selectedSmId = null) {
 
         // Gefilterte Hersteller für Dropdown
         if (!filteredVendors[vendor.id]) {
-            if (!onlyWithoutSmId.checked || !hasValidNfcId) {
+            if (!onlyWithoutSmId.checked || !hasValidTag) {
                 filteredVendors[vendor.id] = vendor.name;
             }
         }
@@ -142,7 +148,7 @@ function populateLocationDropdown(data) {
         return;
     }
 
-    locationSelect.innerHTML = '<option value="">Bitte wählen...</option>';
+    locationSelect.innerHTML = '<option value="">Please choose...</option>';
     // Dropdown mit gefilterten Herstellern befüllen - alphabetisch sortiert
     Object.entries(data)
         .sort(([, nameA], [, nameB]) => nameA.localeCompare(nameB)) // Sort vendors alphabetically by name
@@ -163,7 +169,7 @@ function updateFilamentDropdown(selectedSmId = null) {
     const selectedColor = document.getElementById("selected-color");
 
     dropdownContentInner.innerHTML = '';
-    selectedText.textContent = "Bitte wählen...";
+    selectedText.textContent = "Please choose...";
     selectedColor.style.backgroundColor = '#FFFFFF';
 
     if (vendorId) {
@@ -175,20 +181,26 @@ function updateFilamentDropdown(selectedSmId = null) {
                 return false;
             }
 
-            const hasValidNfcId = spool.extra && 
-                                 spool.extra.nfc_id && 
-                                 spool.extra.nfc_id !== '""' && 
-                                 spool.extra.nfc_id !== '"\\"\\"\\""';
+            // Check for valid tag in extra.tag field (primary) or nfc_id (legacy)
+            const hasValidTag = spool.extra && (
+                (spool.extra.tag && 
+                 spool.extra.tag !== '""' && 
+                 spool.extra.tag !== '"\\"\\"\\""' &&
+                 spool.extra.tag.replace(/"/g, '').length > 0) ||
+                (spool.extra.nfc_id && 
+                 spool.extra.nfc_id !== '""' && 
+                 spool.extra.nfc_id !== '"\\"\\"\\""')
+            );
             
             return spool.filament.vendor.id == vendorId && 
-                   (!onlyWithoutSmId || !hasValidNfcId);
+                   (!onlyWithoutSmId || !hasValidTag);
         });
 
         filteredFilaments.forEach(spool => {
             const option = document.createElement("div");
             option.className = "dropdown-option";
             option.setAttribute("data-value", spool.filament.id);
-            option.setAttribute("data-nfc-id", spool.extra.nfc_id || "");
+            option.setAttribute("data-tag", spool.extra?.tag || spool.extra?.nfc_id || "");
             
 
             // Generate color representation based on filament type (single or multi color)
@@ -391,7 +403,7 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshButton.addEventListener('click', async () => {
             try {
                 refreshButton.disabled = true;
-                refreshButton.textContent = 'Wird aktualisiert...';
+                refreshButton.textContent = 'Refreshing...';
                 await initSpoolman();
                 refreshButton.textContent = 'Refresh Spoolman';
             } finally {
