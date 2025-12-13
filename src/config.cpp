@@ -1,18 +1,20 @@
 #include "config.h"
 
 // ################### Config Bereich Start
-// ***** PN532 (RFID)
-//#define PN532_SCK   18
-//#define PN532_MOSI  23
-//#define PN532_SS    5
-//#define PN532_MISO  19
+// ***** RC522 RFID Reader Configuration
+// SPI Bus Pins (shared with potential other SPI devices):
+//   CLK   = GPIO18
+//   MISO  = GPIO19
+//   MOSI  = GPIO23
+//   SS    = GPIO5  (RC522_SS_PIN)
+//   RST   = GPIO22 (RC522_RST_PIN) - not used, soft reset only (follows AMSPlusCore)
 const uint8_t PN532_IRQ = 32;
 const uint8_t PN532_RESET = 33;
 #ifdef USE_RC522
-const uint8_t RC522_SS_PIN = 5;
-const uint8_t RC522_RST_PIN = 22;
+const uint8_t RC522_SS_PIN = 5;    // SPI Chip Select for RC522
+const uint8_t RC522_RST_PIN = 22;  // Reset pin (not actively used - PCD_Init handles soft reset)
 #endif
-// ***** PN532
+// ***** RC522 RFID Reader
 
 // ***** HX711 (Waage)
 // HX711 circuit wiring

@@ -44,54 +44,54 @@ static int rc522ConsecutiveInvalid = 0;
 class Rc522Nfc {
   public:
     void begin() {
-      // Initialize SPI with explicit pins
+      // AMSPlusCore approach: Initialize SPI first, then RC522 module.
+      // Use explicit pins: CLK=18, MISO=19, MOSI=23, SS=RC522_SS_PIN
+      Serial.println("RC522: Initializing SPI (CLK=18, MISO=19, MOSI=23, SS=5)...");
       SPI.begin(18, 19, 23, RC522_SS_PIN);
-      delay(50);
+      delay(100);  // Allow time for SPI to stabilize
       
-      // Ensure reset pin is configured and issue a reset pulse to improve reliability
-      pinMode(RC522_RST_PIN, OUTPUT);
-      digitalWrite(RC522_RST_PIN, HIGH);
-      delay(10);
-      digitalWrite(RC522_RST_PIN, LOW);
-      delay(50);
-      digitalWrite(RC522_RST_PIN, HIGH);
-      delay(50);
-
-      // Initialize RC522
+      // Initialize RC522 (uses soft-reset internally via PCD_Init)
+      // Note: RST pin is set low by the MFRC522 library during init (soft reset)
+      // We do NOT manually toggle RST - let PCD_Init handle it
+      Serial.println("RC522: Calling PCD_Init (software reset)...");
       rfid.PCD_Init();
       delay(100);
       
-      // Set Antenna Gain to 43dB (optimized for stability)
+      // Configure antenna gain to 43dB (matches AMSPlusCore pattern)
       rfid.PCD_SetAntennaGain(rfid.RxGain_43dB);
+      delay(50);
       
-      // Verify communication
+      // Verify communication by reading VersionReg
       byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
-      Serial.print("RC522 Firmware Version: 0x");
+      Serial.print("RC522 VersionReg: 0x");
       Serial.print(version, HEX);
+      
       if (version == 0x00 || version == 0xFF) {
-        Serial.println(" - WARNING: Communication problem or no RC522 detected!");
-
-        // Try reinitializing SPI without explicit pin mapping (fallback to default VSPI)
-        Serial.println("RC522: attempting fallback SPI.begin() and re-init...");
-        SPI.begin();
-        delay(50);
-        rfid.PCD_Init();
+        Serial.println(" - FAILED: No RC522 detected!");
+        Serial.println("RC522: Attempting soft recovery with antenna recycle...");
+        
+        // Antenna OFF/ON cycle to reset RF field
+        rfid.PCD_AntennaOff();
         delay(100);
+        rfid.PCD_AntennaOn();
+        delay(100);
+        
+        // Try reading version again
         version = rfid.PCD_ReadRegister(rfid.VersionReg);
-        Serial.print("RC522 Fallback Version: 0x");
+        Serial.print("RC522 VersionReg after recovery: 0x");
         Serial.print(version, HEX);
         if (version == 0x00 || version == 0xFF) {
-          Serial.println(" - still no RC522 detected");
+          Serial.println(" - Still FAILED");
         } else {
-          Serial.println(" - OK after fallback");
+          Serial.println(" - Recovered");
         }
       } else {
         Serial.println(" - OK");
       }
       
-      // Ensure antenna is explicitly enabled after init
+      // Ensure antenna is ON
       rfid.PCD_AntennaOn();
-      Serial.println("RC522 SPI initialization complete - antenna ON");
+      Serial.println("RC522 initialization complete");
     }
 
     void dumpRegisters(const char* ctx) {

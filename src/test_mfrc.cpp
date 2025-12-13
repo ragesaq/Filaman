@@ -207,48 +207,55 @@ void setup() {
   }
 
   // Initialize SPI with pins matching the board wiring
+  // CLK=18, MISO=19, MOSI=23, SS=5
+  Serial.println("[RC522 TEST] Initializing SPI bus...");
   SPI.begin(18, 19, 23, SS_PIN);
+  delay(100);  // Allow SPI to stabilize
   
-  // AMSPlusCore uses Soft Reset. We skip manual RST toggle here.
-  // pinMode(RST_PIN, OUTPUT);
-  // digitalWrite(RST_PIN, HIGH);
-  // delay(50);
-
+  // Initialize RC522 with soft-reset (PCD_Init handles reset internally)
+  // Following AMSPlusCore best practices: let PCD_Init manage the reset sequence
+  Serial.println("[RC522 TEST] Calling PCD_Init (software reset)...");
   mfrc522.PCD_Init();
   delay(100);
-
-  // --- DIAGNOSTIC: Antenna Power Impact Test ---
-  // 1. Turn Antenna OFF and check stability
-  mfrc522.PCD_AntennaOff();
-  Serial.println("TEST: Antenna OFF. Reading VersionReg (expect 0xB2)...");
-  for(int i=0; i<10; i++) {
-     byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-     Serial.print("v="); Serial.print(v, HEX); Serial.print(" ");
-     delay(100);
-  }
-  Serial.println();
-
-  // 2. Turn Antenna ON (Max Gain) and check stability
+  
+  // Configure antenna gain
+  Serial.println("[RC522 TEST] Setting antenna gain to 43dB...");
   mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_43dB);
-  mfrc522.PCD_AntennaOn();
-  Serial.println("TEST: Antenna ON (43dB). Reading VersionReg...");
-  for(int i=0; i<10; i++) {
+  delay(50);
+
+  // --- DIAGNOSTIC: Verify RC522 Communication ---
+  Serial.println("[RC522 TEST] Antenna OFF - Reading VersionReg (expect 0xB2)...");
+  mfrc522.PCD_AntennaOff();
+  delay(50);
+  for(int i=0; i<5; i++) {
      byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-     Serial.print("v="); Serial.print(v, HEX); Serial.print(" ");
+     Serial.print("v=0x"); Serial.print(v, HEX); Serial.print(" ");
      delay(100);
   }
   Serial.println();
-  // ---------------------------------------------
 
-  Serial.println("Applied AMSPlusCore settings: Soft Reset & Gain (43dB)");
+  Serial.println("[RC522 TEST] Antenna ON (43dB) - Reading VersionReg...");
+  mfrc522.PCD_AntennaOn();
+  delay(50);
+  for(int i=0; i<5; i++) {
+     byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+     Serial.print("v=0x"); Serial.print(v, HEX); Serial.print(" ");
+     delay(100);
+  }
+  Serial.println();
 
   byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-  Serial.print("Test RC522 Version: 0x"); Serial.println(v, HEX);
+  Serial.print("[RC522 TEST] Final VersionReg: 0x"); Serial.println(v, HEX);
   if (v == 0x00 || v == 0xFF) {
-    Serial.println("WARNING: RC522 appears not present or not responding");
+    Serial.println("ERROR: RC522 is not responding! Check wiring:");
+    Serial.println("  - CLK  -> GPIO18");
+    Serial.println("  - MISO -> GPIO19");
+    Serial.println("  - MOSI -> GPIO23");
+    Serial.println("  - SS   -> GPIO5");
+    Serial.println("  - RST  -> GPIO22 (not used - soft reset only)");
+  } else {
+    Serial.println("SUCCESS: RC522 detected and responding");
   }
-
-  mfrc522.PCD_AntennaOn();
   // Snapshot important registers for diagnosis (pre-sweep baseline)
   {
     const MFRC522::PCD_Register regs_snapshot[] = {
