@@ -71,16 +71,11 @@ static uint8_t clamp8(int v) {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("[MQTT] Received topic ");
-  Serial.print(topic);
-  Serial.print(" -> length: ");
-  Serial.println(length);
-  
-  // Print payload in chunks to avoid buffer issues, though Serial is stream
-  for (unsigned int i = 0; i < length; ++i) {
-    Serial.write(payload[i]);
-  }
-  Serial.println();
+  // Suppress MQTT payload logging to keep output focused on RC522 diagnostics
+  // Serial.print("[MQTT] Received topic ");
+  // Serial.print(topic);
+  // Serial.print(" -> length: ");
+  // Serial.println(length);
 }
 
 bool connectToWifi() {
@@ -187,27 +182,10 @@ void setup() {
   Serial.begin(921600);
   while (!Serial) { delay(10); }
   
-  Serial.println("Starting MFRC522 test immediately...");
-  delay(2000); 
-
-  if (kTestWifiConfigured) {
-    wifiConnected = connectToWifi();
-  } else {
-    Serial.println("[MQTT] Wi-Fi credentials not defined; skipping network checks.");
-  }
-
-  if (kTestMqttConfigured) {
-    if (wifiConnected) {
-      mqttConnected = connectToMqtt();
-    } else {
-      Serial.println("[MQTT] Skipping MQTT because Wi-Fi is unavailable");
-    }
-  } else {
-    Serial.println("[MQTT] MQTT broker not configured for this test");
-  }
-
-  // Initialize SPI with pins matching the board wiring
-  // CLK=18, MISO=19, MOSI=23, SS=5
+  Serial.println("\n\n=== MFRC522 RFID TEST ===\n");
+  delay(500);
+  
+  // Initialize RC522 FIRST (before MQTT) for focused testing
   Serial.println("[RC522 TEST] Initializing SPI bus...");
   SPI.begin(18, 19, 23, SS_PIN);
   delay(100);  // Allow SPI to stabilize
@@ -295,6 +273,21 @@ void setup() {
       Serial.print("  "); Serial.print(names[i]); Serial.print(" = 0x"); Serial.println(rv, HEX);
     }
   }
+  Serial.println("\n[RC522 TEST] Initialization complete\n");
+  
+  // Optional: Initialize MQTT only if explicitly configured
+  // Comment out the lines below to focus on RC522-only testing
+  #if 0  // Disabled for RC522-focused testing
+  if (kTestWifiConfigured) {
+    wifiConnected = connectToWifi();
+  } else {
+    Serial.println("[MQTT] Wi-Fi credentials not defined");
+  }
+  if (kTestMqttConfigured && wifiConnected) {
+    mqttConnected = connectToMqtt();
+  }
+  #endif
+  
   Serial.println("Serial: send 's' to run manual RF sweep");
 }
 
